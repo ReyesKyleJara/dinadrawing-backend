@@ -7,7 +7,7 @@ use Illuminate\Database\Eloquent\Model;
 class Plan extends Model
 {
     protected $fillable = [
-        'creator_id',
+        'admin_id',
         'title',
         'description',
         'plan_date',
@@ -22,9 +22,17 @@ class Plan extends Model
         'is_deleted',
     ];
 
-    public function creator()
+    protected $casts = [
+        'admin_id' => 'integer',
+        'latitude' => 'float',
+        'longitude' => 'float',
+        'is_archived' => 'boolean',
+        'is_deleted' => 'boolean',
+    ];
+
+    public function admin()
     {
-        return $this->belongsTo(User::class, 'creator_id');
+        return $this->belongsTo(User::class, 'admin_id');
     }
 
     public function members()
