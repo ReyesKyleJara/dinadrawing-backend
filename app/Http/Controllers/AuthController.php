@@ -5,6 +5,8 @@ namespace App\Http\Controllers;
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Validation\ValidationException;
 
 class AuthController extends Controller
@@ -62,20 +64,77 @@ class AuthController extends Controller
 
     public function updateProfile(Request $request)
     {
+        Log::info('Profile update started');
+
         $user = $request->user();
 
-        $validated = $request->validate([
-            'name' => ['required', 'string', 'max:255'],
-            'username' => ['required', 'string', 'max:255', 'unique:users,username,' . $user->id],
-        ]);
+        try {
+            $photoFile = $request->file('photo') ?? $request->file('profile_picture');
 
-        $user->fill($validated);
-        $user->save();
+            $hasPhotoFile = $request->hasFile('photo') || $request->hasFile('profile_picture');
 
-        return response()->json([
-            'message' => 'Profile updated successfully',
-            'user' => $user->fresh(),
-        ]);
+            $validated = $request->validate([
+                'name' => ['nullable', 'string', 'max:255'],
+                'username' => ['nullable', 'string', 'max:255', 'unique:users,username,' . $user->id],
+                'profile_picture' => ['nullable', 'file', 'image', 'mimes:jpg,jpeg,png,webp', 'max:8192'],
+                'photo' => ['nullable', 'file', 'image', 'mimes:jpg,jpeg,png,webp', 'max:8192'],
+            ]);
+
+            $name = trim((string) ($validated['name'] ?? $user->name));
+            $username = trim(str_replace('@', '', (string) ($validated['username'] ?? $user->username)));
+
+            if ($name === '' && $username === '' && !$hasPhotoFile) {
+                throw ValidationException::withMessages([
+                    'name' => ['At least one of name, username, or photo is required.'],
+                ]);
+            }
+
+
+            $user->fill([
+                'name' => $name,
+                'username' => $username,
+            ]);
+
+            if ($photoFile instanceof \Illuminate\Http\UploadedFile) {
+                $path = Storage::disk('public')->putFile('profile_pictures', $photoFile);
+                $user->photo_path = $path;
+                $user->photo_url = Storage::disk('public')->url($path);
+                Log::info('Profile update image upload path', [
+                    'stored_path' => $path,
+                    'public_url' => $user->photo_url,
+                ]);
+            }
+
+            $user->save();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Profile updated successfully',
+                'user' => $user->fresh(),
+            ], 200);
+        } catch (ValidationException $e) {
+            Log::warning('Profile update validation failed', [
+                'errors' => $e->errors(),
+                'message' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+
+            return response()->json([
+                'errors' => $e->errors(),
+                'message' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ], 422);
+        } catch (\Throwable $e) {
+            Log::error('Profile update failed', [
+                'message' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Profile update failed: ' . $e->getMessage(),
+            ], 500);
+        }
     }
 
     public function changePassword(Request $request)
