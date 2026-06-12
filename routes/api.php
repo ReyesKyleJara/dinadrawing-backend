@@ -49,4 +49,7 @@ Route::middleware('auth:sanctum')->group(function () {
 
     // --- Leave Plan Routes ---
     Route::post('/plans/{plan}/leave', [PlanController::class, 'leave']);
+
+    // --- Plan Post Voting Route ---
+    Route::post('/plan-posts/{post}/vote', [PlanPostController::class, 'vote']);
 });
