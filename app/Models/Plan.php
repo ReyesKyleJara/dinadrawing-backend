@@ -32,12 +32,18 @@ class Plan extends Model
 
     public function admin()
     {
-        return $this->belongsTo(User::class, 'admin_id');
+        return $this->belongsTo(
+            User::class,
+            'admin_id'
+        );
     }
 
     public function members()
     {
-        return $this->belongsToMany(User::class, 'plan_members')
+        return $this->belongsToMany(
+            User::class,
+            'plan_members'
+        )
             ->withPivot('role')
             ->withTimestamps();
     }
@@ -45,5 +51,11 @@ class Plan extends Model
     public function posts()
     {
         return $this->hasMany(PlanPost::class);
+    }
+
+    public function responsibilityPosts()
+    {
+        return $this->hasMany(PlanPost::class)
+            ->where('post_type', 'responsibility');
     }
 }

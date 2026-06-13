@@ -29,4 +29,20 @@ class User extends Authenticatable
             'password' => 'hashed',
         ];
     }
+
+    public function responsibilityItems()
+    {
+        return $this->hasMany(
+            PlanResponsibilityItem::class,
+            'member_user_id'
+        );
+    }
+
+    public function responsibilityAssignments()
+    {
+        return $this->hasMany(
+            PlanResponsibilityAssignment::class,
+            'user_id'
+        );
+    }
 }
