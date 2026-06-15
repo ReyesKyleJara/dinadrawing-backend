@@ -50,12 +50,26 @@ class Plan extends Model
 
     public function posts()
     {
-        return $this->hasMany(PlanPost::class);
+        return $this->hasMany(
+            PlanPost::class
+        );
     }
 
     public function responsibilityPosts()
     {
-        return $this->hasMany(PlanPost::class)
-            ->where('post_type', 'responsibility');
+        return $this->hasMany(
+            PlanPost::class
+        )->where(
+            'post_type',
+            'responsibility'
+        );
+    }
+
+    public function budget()
+    {
+        return $this->hasOne(
+            PlanBudget::class,
+            'plan_id'
+        );
     }
 }
