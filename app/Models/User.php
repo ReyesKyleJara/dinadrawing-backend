@@ -10,6 +10,16 @@ class User extends Authenticatable
 {
     use HasApiTokens, Notifiable;
 
+    public function decisionWheels()
+    {
+        return $this->hasMany(DecisionWheel::class);
+    }
+
+    public function blitzPolls()
+    {
+        return $this->hasMany(BlitzPoll::class);
+    }
+
     protected $fillable = [
         'name',
         'username',
