@@ -3,6 +3,7 @@
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\Storage;
 
 class Plan extends Model
 {
@@ -18,6 +19,8 @@ class Plan extends Model
         'invite_code',
         'status',
         'banner_color',
+        'banner_image_path',
+        'theme_color',
         'is_archived',
         'is_deleted',
     ];
@@ -29,6 +32,26 @@ class Plan extends Model
         'is_archived' => 'boolean',
         'is_deleted' => 'boolean',
     ];
+
+    protected $appends = [
+        'banner_image_url',
+    ];
+
+    public function getBannerImageUrlAttribute(): ?string
+    {
+        if (!$this->banner_image_path) {
+            return null;
+        }
+
+        $path = Storage::url($this->banner_image_path);
+        $request = request();
+
+        if ($request !== null) {
+            return $request->getSchemeAndHttpHost() . $path;
+        }
+
+        return url($path);
+    }
 
     public function admin()
     {
@@ -69,6 +92,22 @@ class Plan extends Model
     {
         return $this->hasOne(
             PlanBudget::class,
+            'plan_id'
+        );
+    }
+
+    public function invitations()
+    {
+        return $this->hasMany(
+            PlanInvitation::class,
+            'plan_id'
+        );
+    }
+
+    public function activityNotifications()
+    {
+        return $this->hasMany(
+            ActivityNotification::class,
             'plan_id'
         );
     }

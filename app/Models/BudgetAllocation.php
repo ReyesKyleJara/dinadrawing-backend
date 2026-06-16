@@ -12,11 +12,16 @@ class BudgetAllocation extends Model
     protected $fillable = [
         'budget_id',
         'user_id',
+        'manual_name',
         'is_included',
         'planned_share',
         'is_paid',
         'paid_at',
         'marked_paid_by',
+
+        'is_former_member',
+        'former_member_name',
+        'member_left_at',
     ];
 
     protected function casts(): array
@@ -26,6 +31,9 @@ class BudgetAllocation extends Model
             'planned_share' => 'decimal:2',
             'is_paid' => 'boolean',
             'paid_at' => 'datetime',
+
+            'is_former_member' => 'boolean',
+            'member_left_at' => 'datetime',
         ];
     }
 

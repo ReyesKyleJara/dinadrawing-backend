@@ -15,6 +15,7 @@ class PlanPost extends Model
 
         // Poll
         'poll_question',
+        'poll_kind',
         'poll_options',
         'allow_multiple',
         'anonymous',
@@ -24,6 +25,9 @@ class PlanPost extends Model
         'voting_starts_at',
         'voting_ends_at',
         'is_voting_closed',
+        'finalized_option_index',
+        'finalized_at',
+        'applied_to_plan_at',
 
         // Responsibilities
         'responsibility_title',
@@ -46,6 +50,9 @@ class PlanPost extends Model
         'voting_starts_at' => 'datetime',
         'voting_ends_at' => 'datetime',
         'is_voting_closed' => 'boolean',
+        'finalized_option_index' => 'integer',
+        'finalized_at' => 'datetime',
+        'applied_to_plan_at' => 'datetime',
 
         // Responsibilities
         'responsibility_allow_member_items' => 'boolean',
@@ -77,5 +84,21 @@ class PlanPost extends Model
             PlanResponsibilityItem::class,
             'plan_post_id'
         )->orderBy('position');
+    }
+
+    public function comments()
+    {
+        return $this->hasMany(
+            PlanPostComment::class,
+            'plan_post_id'
+        )->oldest();
+    }
+
+    public function activityNotifications()
+    {
+        return $this->hasMany(
+            ActivityNotification::class,
+            'plan_post_id'
+        );
     }
 }

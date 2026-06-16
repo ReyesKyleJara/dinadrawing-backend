@@ -5,7 +5,9 @@ namespace App\Http\Controllers;
 use App\Models\Plan;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
+use Illuminate\Validation\Rule;
 
 class PlanController extends Controller
 {
@@ -65,6 +67,7 @@ class PlanController extends Controller
             'invite_code' => $inviteCode,
             'status' => $validated['status'] ?? 'Plan Ongoing',
             'banner_color' => $bannerColor,
+            'theme_color' => '#F2B73F',
             'is_archived' => false,
             'is_deleted' => false,
         ]);
@@ -166,10 +169,20 @@ class PlanController extends Controller
         }
 
         if ($plan->admin_id !== $user->id) {
-            $plan->members()->detach($user->id);
+            DB::transaction(function () use ($plan, $user) {
+                $this->markBudgetForMemberDeparture(
+                    $plan,
+                    $user
+                );
+
+                $plan->members()->detach($user->id);
+            });
 
             return response()->json([
                 'message' => 'You have left the plan successfully.',
+                'budget_needs_review' =>
+                    (bool) optional($plan->budget)
+                        ->needs_review,
             ]);
         }
 
@@ -199,6 +212,11 @@ class PlanController extends Controller
         }
 
         DB::transaction(function () use ($plan, $user, $newAdminId) {
+            $this->markBudgetForMemberDeparture(
+                $plan,
+                $user
+            );
+
             $plan->update([
                 'admin_id' => $newAdminId,
             ]);
@@ -217,29 +235,96 @@ class PlanController extends Controller
 
     public function updateBanner(Request $request, Plan $plan)
     {
+        return $this->updateAppearance($request, $plan);
+    }
+
+    public function updateAppearance(Request $request, Plan $plan)
+    {
         if ($plan->is_deleted) {
             return response()->json([
                 'message' => 'Plan not found.',
             ], 404);
         }
 
-        if ($plan->admin_id !== $request->user()->id) {
+        if ((int) $plan->admin_id !== (int) $request->user()->id) {
             return response()->json([
                 'message' => 'Only the plan admin can update this plan.',
             ], 403);
         }
 
         $validated = $request->validate([
-            'banner_color' => ['required', 'string', 'max:20'],
+            'banner_color' => [
+                'nullable',
+                'string',
+                'regex:/^#[0-9A-Fa-f]{6}$/',
+            ],
+            'theme_color' => [
+                'nullable',
+                'string',
+                Rule::in($this->allowedThemeColors()),
+            ],
+            'banner_image' => [
+                'nullable',
+                'image',
+                'mimes:jpg,jpeg,png,webp',
+                'max:5120',
+            ],
+            'remove_banner_image' => [
+                'nullable',
+                'boolean',
+            ],
         ]);
 
-        $plan->update([
-            'banner_color' => $validated['banner_color'],
-        ]);
+        $updates = [];
+
+        if (array_key_exists('banner_color', $validated)) {
+            $updates['banner_color'] = strtoupper(
+                $validated['banner_color']
+            );
+        }
+
+        if (array_key_exists('theme_color', $validated)) {
+            $updates['theme_color'] = strtoupper(
+                $validated['theme_color']
+            );
+        }
+
+        $removeImage = (bool) ($validated['remove_banner_image'] ?? false);
+
+        if ($removeImage && $plan->banner_image_path) {
+            Storage::disk('public')->delete(
+                $plan->banner_image_path
+            );
+
+            $updates['banner_image_path'] = null;
+        }
+
+        if ($request->hasFile('banner_image')) {
+            if ($plan->banner_image_path) {
+                Storage::disk('public')->delete(
+                    $plan->banner_image_path
+                );
+            }
+
+            $updates['banner_image_path'] = $request
+                ->file('banner_image')
+                ->store('plan-banners', 'public');
+        }
+
+        if (empty($updates)) {
+            return response()->json([
+                'message' => 'There are no appearance changes to save.',
+            ], 422);
+        }
+
+        $plan->update($updates);
 
         return response()->json([
-            'message' => 'Banner updated successfully.',
-            'plan' => $plan->load(['admin', 'members']),
+            'message' => 'Plan appearance updated successfully.',
+            'plan' => $plan->fresh()->load([
+                'admin',
+                'members',
+            ]),
         ]);
     }
 
@@ -266,7 +351,16 @@ class PlanController extends Controller
             'latitude' => ['nullable', 'numeric'],
             'longitude' => ['nullable', 'numeric'],
             'status' => ['nullable', 'string', 'max:255'],
-            'banner_color' => ['nullable', 'string', 'max:20'],
+            'banner_color' => [
+                'nullable',
+                'string',
+                'regex:/^#[0-9A-Fa-f]{6}$/',
+            ],
+            'theme_color' => [
+                'nullable',
+                'string',
+                Rule::in($this->allowedThemeColors()),
+            ],
         ]);
 
         $plan->update($validated);
@@ -435,6 +529,71 @@ class PlanController extends Controller
         ]);
     }
 
+    private function markBudgetForMemberDeparture(
+        Plan $plan,
+        $user
+    ): void {
+        $budget = $plan->budget;
+
+        if ($budget === null) {
+            return;
+        }
+
+        $allocation = $budget
+            ->allocations()
+            ->where('user_id', $user->id)
+            ->first();
+
+        if ($allocation === null) {
+            return;
+        }
+
+        $departures = collect(
+            $budget->review_context['departures'] ?? []
+        );
+
+        $departures = $departures
+            ->reject(
+                fn (array $departure) =>
+                    (int) ($departure['user_id'] ?? 0) ===
+                    (int) $user->id
+            )
+            ->values();
+
+        $departures->push([
+            'user_id' => (int) $user->id,
+            'name' => (string) $user->name,
+            'planned_share' =>
+                (float) $allocation->planned_share,
+            'was_included' =>
+                (bool) $allocation->is_included,
+            'was_paid' =>
+                (bool) $allocation->is_paid,
+            'paid_at' => optional(
+                $allocation->paid_at
+            )->toISOString(),
+            'left_at' => now()->toISOString(),
+        ]);
+
+        $allocation->update([
+            'is_included' => false,
+            'is_former_member' => true,
+            'former_member_name' =>
+                (string) $user->name,
+            'member_left_at' => now(),
+        ]);
+
+        $budget->update([
+            'needs_review' => true,
+            'review_reason' => 'member_left',
+            'review_context' => [
+                'departures' => $departures->all(),
+            ],
+            'reviewed_at' => null,
+            'reviewed_by' => null,
+        ]);
+    }
+
     private function generateUniqueInviteCode(): string
     {
         do {
@@ -442,6 +601,18 @@ class PlanController extends Controller
         } while (Plan::where('invite_code', $code)->exists());
 
         return $code;
+    }
+
+    private function allowedThemeColors(): array
+    {
+        return [
+            '#F2B73F',
+            '#4A78D6',
+            '#8B5CF6',
+            '#0F9D8A',
+            '#E85D9E',
+            '#F47B3A',
+        ];
     }
 
     private function generateRandomBannerColor(): string

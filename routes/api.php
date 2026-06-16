@@ -8,6 +8,9 @@ use App\Http\Controllers\PlanPostController;
 use App\Http\Controllers\PlanBudgetController;
 use App\Http\Controllers\PlanResponsibilityController;
 use App\Http\Controllers\UserSettingsController;
+use App\Http\Controllers\PlanInvitationController;
+use App\Http\Controllers\PlanPostCommentController;
+use App\Http\Controllers\ActivityNotificationController;
 
 Route::get('/test', function () {
     return response()->json([
@@ -54,16 +57,29 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/plans/{plan}', [PlanController::class, 'show']);
     Route::patch('/plans/{plan}', [PlanController::class, 'update']);
     Route::patch('/plans/{plan}/banner', [PlanController::class, 'updateBanner']);
+    Route::post('/plans/{plan}/appearance', [PlanController::class, 'updateAppearance']);
     Route::delete('/plans/{plan}', [PlanController::class, 'destroy']);
     Route::post('/plans/{plan}/leave', [PlanController::class, 'leave']);
 
+    // Plan Invitations
+    Route::post('/plans/{plan}/invitations', [PlanInvitationController::class, 'store']);
+    Route::get('/invitations', [PlanInvitationController::class, 'index']);
+    Route::patch('/invitations/{invitation}/read', [PlanInvitationController::class, 'markRead']);
+    Route::patch('/invitations/{invitation}/respond', [PlanInvitationController::class, 'respond']);
+
+    // Unified Activity Feed
+Route::get('/activity', [ActivityNotificationController::class, 'index']);
+Route::patch('/activity/read-all',[ActivityNotificationController::class, 'markAllRead']);
+Route::patch('/activity-notifications/{notification}/read', [ActivityNotificationController::class, 'markRead']);
+
     // Budget Planning
     Route::get('/plans/{plan}/budget', [PlanBudgetController::class, 'show']);
-    Route::post('/plans/{plan}/budget', [PlanBudgetController::class, 'store']);
-    Route::put('/plans/{plan}/budget', [PlanBudgetController::class, 'update']);
-    Route::patch('/plans/{plan}/budget/settings', [PlanBudgetController::class, 'updateSettings']);
-    Route::patch('/plans/{plan}/budget/allocations/{allocation}/paid', [PlanBudgetController::class, 'setPaidStatus']);
-    Route::delete('/plans/{plan}/budget', [PlanBudgetController::class, 'destroy']);
+Route::post('/plans/{plan}/budget', [PlanBudgetController::class, 'store']);
+Route::put('/plans/{plan}/budget', [PlanBudgetController::class, 'update']);
+Route::delete('/plans/{plan}/budget', [PlanBudgetController::class, 'destroy']);
+Route::patch('/plans/{plan}/budget/settings', [PlanBudgetController::class, 'updateSettings']);
+Route::patch('/plans/{plan}/budget/allocations/{allocation}/paid', [PlanBudgetController::class, 'setPaidStatus']);
+Route::patch('/plans/{plan}/budget/review', [PlanBudgetController::class, 'resolveReview']);
 
     // Plan Posts and Feed
     Route::get('/plans/{plan}/posts', [PlanPostController::class, 'index']);
@@ -76,6 +92,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/plan-posts/{post}/options', [PlanPostController::class, 'addOption']);
     Route::patch('/plan-posts/{post}/poll', [PlanPostController::class, 'updatePoll']);
     Route::patch('/plan-posts/{post}/voting', [PlanPostController::class, 'toggleVoting']);
+    Route::patch('/plan-posts/{post}/finalize', [PlanPostController::class, 'finalizePoll']);
+    Route::patch('/plan-posts/{post}/apply-result', [PlanPostController::class, 'applyPollResult']);
 
     // Who's Doing What / Responsibilities
     Route::post('/plans/{plan}/responsibilities', [PlanResponsibilityController::class, 'store']);
@@ -88,4 +106,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/responsibility-items/{item}/preassign', [PlanResponsibilityController::class, 'preassign']);
     Route::delete('/responsibility-items/{item}/preassign/{assignment}', [PlanResponsibilityController::class, 'removePreassignment']);
     Route::patch('/responsibility-items/{item}/response', [PlanResponsibilityController::class, 'respond']);
+// Post Comments
+Route::get('/plan-posts/{post}/comments', [PlanPostCommentController::class, 'index']);
+Route::post('/plan-posts/{post}/comments', [PlanPostCommentController::class, 'store']);
+Route::delete('/plan-post-comments/{comment}', [PlanPostCommentController::class, 'destroy']);    
 });

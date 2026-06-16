@@ -91,4 +91,45 @@ public function markedBudgetPayments()
         'marked_paid_by'
     );
 }
+
+public function receivedPlanInvitations()
+{
+    return $this->hasMany(
+        PlanInvitation::class,
+        'invited_user_id'
+    );
+}
+
+public function sentPlanInvitations()
+{
+    return $this->hasMany(
+        PlanInvitation::class,
+        'invited_by'
+    );
+}
+
+public function planPostComments()
+{
+    return $this->hasMany(
+        PlanPostComment::class,
+        'user_id'
+    );
+}
+
+public function receivedActivityNotifications()
+{
+    return $this->hasMany(
+        ActivityNotification::class,
+        'recipient_user_id'
+    );
+}
+
+public function triggeredActivityNotifications()
+{
+    return $this->hasMany(
+        ActivityNotification::class,
+        'actor_user_id'
+    );
+}
+
 }

@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use Carbon\Carbon;
 use App\Models\Plan;
 use App\Models\PlanPost;
 use App\Models\PlanPostVote;
@@ -51,6 +52,10 @@ class PlanPostController extends Controller
             'responsibilityItems.member:id,name,username,email',
 
             'responsibilityItems.assignments.user:id,name,username,email',
+        ])
+    ->withCount([
+        'comments as comment_count',
+
         ])
         ->orderByDesc('is_pinned')
         ->latest()
@@ -337,9 +342,17 @@ class PlanPostController extends Controller
             'is_voting_closed' => ['required', 'boolean'],
         ]);
 
-        $post->update([
+        $updates = [
             'is_voting_closed' => $validated['is_voting_closed'],
-        ]);
+        ];
+
+        if (!$validated['is_voting_closed']) {
+            $updates['finalized_option_index'] = null;
+            $updates['finalized_at'] = null;
+            $updates['applied_to_plan_at'] = null;
+        }
+
+        $post->update($updates);
 
         $post->load([
             'user:id,name,username,email',
@@ -378,6 +391,10 @@ class PlanPostController extends Controller
 
         $validated = $request->validate([
             'poll_question' => ['nullable', 'string', 'max:255'],
+            'poll_kind' => [
+                'nullable',
+                Rule::in(['general', 'date', 'location']),
+            ],
             'poll_options' => ['nullable', 'array', 'min:2', 'max:10'],
             'poll_options.*' => ['required', 'string', 'max:255'],
             'allow_multiple' => ['nullable', 'boolean'],
@@ -396,6 +413,16 @@ class PlanPostController extends Controller
         $hasVotes = $totalVoters > 0;
 
         $updates = [];
+
+        if (array_key_exists('poll_kind', $validated)) {
+            if ($hasVotes || $post->finalized_at !== null) {
+                return response()->json([
+                    'message' => 'Poll type cannot be changed after voting has started.',
+                ], 422);
+            }
+
+            $updates['poll_kind'] = $validated['poll_kind'];
+        }
 
         if (array_key_exists('poll_question', $validated)) {
             $newQuestion = trim((string) $validated['poll_question']);
@@ -504,6 +531,234 @@ class PlanPostController extends Controller
         ]);
     }
 
+    public function finalizePoll(
+        Request $request,
+        PlanPost $post
+    ) {
+        $user = $request->user();
+        $plan = $post->plan;
+
+        if ($post->post_type !== 'poll') {
+            return response()->json([
+                'message' => 'This post is not a poll.',
+            ], 422);
+        }
+
+        if (!$plan || $plan->is_deleted) {
+            return response()->json([
+                'message' => 'Plan not found.',
+            ], 404);
+        }
+
+        if ((int) $plan->admin_id !== (int) $user->id) {
+            return response()->json([
+                'message' => 'Only the plan admin can finalize this poll.',
+            ], 403);
+        }
+
+        $validated = $request->validate([
+            'option_index' => [
+                'nullable',
+                'integer',
+                'min:0',
+            ],
+        ]);
+
+        $options = $post->poll_options ?? [];
+
+        if (count($options) < 1) {
+            return response()->json([
+                'message' => 'This poll has no options to finalize.',
+            ], 422);
+        }
+
+        $voteCounts = array_fill(
+            0,
+            count($options),
+            0
+        );
+
+        foreach ($post->votes as $vote) {
+            $index = (int) $vote->option_index;
+
+            if (array_key_exists($index, $voteCounts)) {
+                $voteCounts[$index]++;
+            }
+        }
+
+        $maxVotes = max($voteCounts);
+        $topIndexes = [];
+
+        foreach ($voteCounts as $index => $count) {
+            if ($count === $maxVotes) {
+                $topIndexes[] = $index;
+            }
+        }
+
+        $selectedIndex = array_key_exists(
+            'option_index',
+            $validated
+        )
+            ? (int) $validated['option_index']
+            : null;
+
+        if (
+            $selectedIndex !== null &&
+            !array_key_exists($selectedIndex, $options)
+        ) {
+            return response()->json([
+                'message' => 'Invalid final poll option.',
+            ], 422);
+        }
+
+        if ($selectedIndex === null) {
+            if (count($topIndexes) !== 1) {
+                return response()->json([
+                    'message' => $maxVotes === 0
+                        ? 'Choose the final result before finalizing this poll.'
+                        : 'The poll ended in a tie. Choose the final result.',
+                    'requires_selection' => true,
+                    'tied_option_indexes' => $topIndexes,
+                    'vote_counts' => $voteCounts,
+                ], 422);
+            }
+
+            $selectedIndex = $topIndexes[0];
+        } elseif (
+            $maxVotes > 0 &&
+            !in_array($selectedIndex, $topIndexes, true)
+        ) {
+            return response()->json([
+                'message' => 'Choose one of the highest-voted options.',
+                'requires_selection' => true,
+                'tied_option_indexes' => $topIndexes,
+                'vote_counts' => $voteCounts,
+            ], 422);
+        }
+
+        $post->update([
+            'is_voting_closed' => true,
+            'finalized_option_index' => $selectedIndex,
+            'finalized_at' => now(),
+            'applied_to_plan_at' => null,
+        ]);
+
+        $post->load([
+            'user:id,name,username,email',
+            'votes.user:id,name,username',
+        ]);
+
+        return response()->json([
+            'message' => 'Poll finalized successfully.',
+            'post' => $this->formatPostForResponse(
+                $post,
+                $request,
+                $plan
+            ),
+        ]);
+    }
+
+    public function applyPollResult(
+        Request $request,
+        PlanPost $post
+    ) {
+        $user = $request->user();
+        $plan = $post->plan;
+
+        if ($post->post_type !== 'poll') {
+            return response()->json([
+                'message' => 'This post is not a poll.',
+            ], 422);
+        }
+
+        if (!$plan || $plan->is_deleted) {
+            return response()->json([
+                'message' => 'Plan not found.',
+            ], 404);
+        }
+
+        if ((int) $plan->admin_id !== (int) $user->id) {
+            return response()->json([
+                'message' => 'Only the plan admin can apply a poll result.',
+            ], 403);
+        }
+
+        if (
+            $post->finalized_at === null ||
+            $post->finalized_option_index === null
+        ) {
+            return response()->json([
+                'message' => 'Finalize the poll before applying its result.',
+            ], 422);
+        }
+
+        if (!in_array($post->poll_kind, ['date', 'location'], true)) {
+            return response()->json([
+                'message' => 'Only date and location poll results can be applied to a plan.',
+            ], 422);
+        }
+
+        $options = $post->poll_options ?? [];
+        $selectedIndex = (int) $post->finalized_option_index;
+        $selectedOption = $options[$selectedIndex] ?? null;
+
+        if ($selectedOption === null) {
+            return response()->json([
+                'message' => 'The finalized option is no longer available.',
+            ], 422);
+        }
+
+        if ($post->poll_kind === 'date') {
+            try {
+                $plan->update([
+                    'plan_date' => Carbon::parse(
+                        $selectedOption
+                    )->toDateString(),
+                ]);
+            } catch (\Throwable $error) {
+                return response()->json([
+                    'message' => 'The winning option is not a valid date.',
+                ], 422);
+            }
+        } else {
+            $location = trim((string) $selectedOption);
+
+            if ($location === '') {
+                return response()->json([
+                    'message' => 'The winning location is empty.',
+                ], 422);
+            }
+
+            $plan->update([
+                'location' => $location,
+            ]);
+        }
+
+        $post->update([
+            'applied_to_plan_at' => now(),
+        ]);
+
+        $post->load([
+            'user:id,name,username,email',
+            'votes.user:id,name,username',
+        ]);
+
+        return response()->json([
+            'message' => $post->poll_kind === 'date'
+                ? 'Winning date applied to the plan.'
+                : 'Winning location applied to the plan.',
+            'plan' => $plan->fresh()->load([
+                'admin',
+                'members',
+            ]),
+            'post' => $this->formatPostForResponse(
+                $post,
+                $request,
+                $plan->fresh()
+            ),
+        ]);
+    }
+
     public function destroyPost(
     Request $request,
     PlanPost $post
@@ -603,6 +858,10 @@ class PlanPostController extends Controller
     {
         $validated = $request->validate([
             'poll_question' => ['required', 'string', 'max:255'],
+            'poll_kind' => [
+                'nullable',
+                Rule::in(['general', 'date', 'location']),
+            ],
             'poll_options' => ['required', 'array', 'min:2', 'max:10'],
             'poll_options.*' => ['required', 'string', 'max:255'],
             'allow_multiple' => ['nullable', 'boolean'],
@@ -631,6 +890,7 @@ class PlanPostController extends Controller
             'post_type' => 'poll',
             'content' => $validated['poll_question'],
             'poll_question' => $validated['poll_question'],
+            'poll_kind' => $validated['poll_kind'] ?? 'general',
             'poll_options' => $cleanOptions,
             'allow_multiple' => $validated['allow_multiple'] ?? false,
             'anonymous' => $validated['anonymous'] ?? true,
@@ -667,6 +927,11 @@ class PlanPostController extends Controller
         $post,
         $request,
         $plan
+    );
+
+    $post->comment_count = (int) (
+        $post->comment_count ??
+        $post->comments()->count()
     );
 
     if ($post->post_type === 'poll') {
@@ -863,6 +1128,21 @@ class PlanPostController extends Controller
             $isPostOwner
         );
 
+    $post->can_finalize_poll =
+        $isPoll &&
+        $isPlanAdmin;
+
+    $post->can_apply_poll_result =
+        $isPoll &&
+        $isPlanAdmin &&
+        in_array(
+            $post->poll_kind,
+            ['date', 'location'],
+            true
+        ) &&
+        $post->finalized_at !== null &&
+        $post->applied_to_plan_at === null;
+
     $post->can_manage_responsibility =
         $canManageResponsibility;
 
@@ -958,6 +1238,25 @@ class PlanPostController extends Controller
         $post->voting_status = $votingState['status'];
         $post->can_vote = $votingState['can_vote'];
         $post->voting_message = $votingState['message'];
+
+        $finalizedIndex = $post->finalized_option_index;
+
+        $post->poll_kind_value = $post->poll_kind ?? 'general';
+        $post->is_poll_finalized = $post->finalized_at !== null;
+        $post->finalized_option_index_value = $finalizedIndex;
+        $post->finalized_option_value =
+            $finalizedIndex !== null &&
+            array_key_exists($finalizedIndex, $options)
+                ? $options[$finalizedIndex]
+                : null;
+        $post->finalized_at_value = optional(
+            $post->finalized_at
+        )->toIso8601String();
+        $post->applied_to_plan_at_value = optional(
+            $post->applied_to_plan_at
+        )->toIso8601String();
+        $post->is_applied_to_plan =
+            $post->applied_to_plan_at !== null;
 
         $post->user_votes = $post->votes
             ->where('user_id', $request->user()->id)

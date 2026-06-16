@@ -19,6 +19,11 @@ class PlanBudget extends Model
         'show_status_to_members',
         'total_estimated',
         'published_at',
+        'needs_review',
+        'review_reason',
+        'review_context',
+        'reviewed_at',
+        'reviewed_by',
     ];
 
     protected function casts(): array
@@ -29,6 +34,9 @@ class PlanBudget extends Model
             'show_status_to_members' => 'boolean',
             'total_estimated' => 'decimal:2',
             'published_at' => 'datetime',
+            'needs_review' => 'boolean',
+            'review_context' => 'array',
+            'reviewed_at' => 'datetime',
         ];
     }
 
@@ -53,6 +61,14 @@ class PlanBudget extends Model
         return $this->belongsTo(
             User::class,
             'updated_by'
+        );
+    }
+
+    public function reviewer()
+    {
+        return $this->belongsTo(
+            User::class,
+            'reviewed_by'
         );
     }
 

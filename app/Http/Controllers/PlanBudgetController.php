@@ -162,6 +162,169 @@ class PlanBudgetController extends Controller
         ]);
     }
 
+    public function resolveReview(
+        Request $request,
+        Plan $plan
+    ): JsonResponse {
+        $this->ensurePlanAdmin($request, $plan);
+
+        $budget = $plan->budget;
+
+        if ($budget === null) {
+            return response()->json([
+                'success' => false,
+                'message' =>
+                    'No budget plan exists for this plan.',
+            ], 404);
+        }
+
+        if (!$budget->needs_review) {
+            return response()->json([
+                'success' => false,
+                'message' =>
+                    'This budget does not currently need review.',
+            ], 422);
+        }
+
+        $validated = $request->validate([
+            'action' => [
+                'required',
+                'in:redistribute_equally,keep_unallocated',
+            ],
+        ]);
+
+        DB::transaction(
+            function () use (
+                $request,
+                $budget,
+                $validated
+            ): void {
+                if (
+                    $validated['action'] ===
+                    'redistribute_equally'
+                ) {
+                    $activeAllocations = $budget
+                        ->allocations()
+                        ->where(
+                            'is_former_member',
+                            false
+                        )
+                        ->where(
+                            'is_included',
+                            true
+                        )
+                        ->orderBy('id')
+                        ->get();
+
+                    if ($activeAllocations->isEmpty()) {
+                        throw ValidationException::withMessages([
+                            'action' =>
+                                'Include at least one active member before redistributing the budget.',
+                        ]);
+                    }
+
+                    $totalEstimatedCents =
+                        $this->toCents(
+                            $budget->total_estimated
+                        );
+
+                    $baseShare = intdiv(
+                        $totalEstimatedCents,
+                        $activeAllocations->count()
+                    );
+
+                    $remainingCents =
+                        $totalEstimatedCents %
+                        $activeAllocations->count();
+
+                    foreach (
+                        $activeAllocations
+                        as $index => $allocation
+                    ) {
+                        $newShareCents =
+                            $baseShare +
+                            (
+                                $index < $remainingCents
+                                    ? 1
+                                    : 0
+                            );
+
+                        $shareChanged =
+                            $this->toCents(
+                                $allocation->planned_share
+                            ) !== $newShareCents;
+
+                        $payload = [
+                            'planned_share' =>
+                                $this->fromCents(
+                                    $newShareCents
+                                ),
+                        ];
+
+                        if ($shareChanged) {
+                            $payload['is_paid'] = false;
+                            $payload['paid_at'] = null;
+                            $payload['marked_paid_by'] =
+                                null;
+                        }
+
+                        $allocation->update($payload);
+                    }
+
+                    $budget->split_type = 'equal';
+                } else {
+                    /*
+                     * Keep all current active shares as-is.
+                     * The departed amount remains visible
+                     * as Unallocated.
+                     */
+                    $budget->split_type = 'custom';
+                }
+
+                $reviewContext =
+                    $budget->review_context ?? [];
+
+                $reviewContext['resolved_action'] =
+                    $validated['action'];
+
+                $reviewContext['resolved_at'] =
+                    now()->toISOString();
+
+                $reviewContext['resolved_by'] = [
+                    'id' =>
+                        (int) $request->user()->id,
+                    'name' =>
+                        (string) $request->user()->name,
+                ];
+
+                $budget->needs_review = false;
+                $budget->review_reason = null;
+                $budget->review_context =
+                    $reviewContext;
+                $budget->reviewed_at = now();
+                $budget->reviewed_by =
+                    $request->user()->id;
+                $budget->updated_by =
+                    $request->user()->id;
+                $budget->save();
+            }
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' =>
+                $validated['action'] ===
+                'redistribute_equally'
+                    ? 'The departed share was redistributed equally.'
+                    : 'The departed share remains unallocated.',
+            'budget' => $this->serializeBudget(
+                $request,
+                $plan,
+                $budget->fresh()
+            ),
+        ]);
+    }
+
     public function setPaidStatus(
         Request $request,
         Plan $plan,
@@ -193,11 +356,19 @@ class PlanBudgetController extends Controller
             ], 422);
         }
 
+        if ($allocation->is_former_member) {
+            return response()->json([
+                'success' => false,
+                'message' =>
+                    'Former member contributions can no longer be edited.',
+            ], 422);
+        }
+
         if (!$allocation->is_included) {
             return response()->json([
                 'success' => false,
                 'message' =>
-                    'Excluded members do not have a contribution status.',
+                    'People removed from the budget do not have a contribution status.',
             ], 422);
         }
 
@@ -209,6 +380,7 @@ class PlanBudgetController extends Controller
         );
 
         $isOwnAllocation =
+            $allocation->user_id !== null &&
             (int) $allocation->user_id === $userId;
 
         $memberMayUpdateOwn =
@@ -320,10 +492,34 @@ class PlanBudgetController extends Controller
                 'min:1',
             ],
 
-            'allocations.*.user_id' => [
-                'required',
+            /*
+             * Existing manual allocations send their database ID
+             * so Paid/Unpaid can be preserved when nothing changed.
+             */
+            'allocations.*.id' => [
+                'nullable',
                 'integer',
-                'distinct',
+            ],
+
+            'allocations.*.allocation_id' => [
+                'nullable',
+                'integer',
+            ],
+
+            /*
+             * A budget person may be either:
+             * - a registered plan member with user_id
+             * - a manually added person with manual_name
+             */
+            'allocations.*.user_id' => [
+                'nullable',
+                'integer',
+            ],
+
+            'allocations.*.manual_name' => [
+                'nullable',
+                'string',
+                'max:150',
             ],
 
             'allocations.*.is_included' => [
@@ -339,46 +535,151 @@ class PlanBudgetController extends Controller
             ],
         ]);
 
-        $planUsers = $this->planUsers($plan);
-
-        if ($planUsers->isEmpty()) {
-            throw ValidationException::withMessages([
-                'allocations' =>
-                    'This plan has no members available for budget allocation.',
-            ]);
-        }
-
-        $validUserIds = $planUsers
+        $validUserIds = $this
+            ->planUsers($plan)
             ->pluck('id')
             ->map(
                 fn ($id) => (int) $id
             )
             ->all();
 
-        $requestedAllocations = collect(
-            $validated['allocations']
-        )->keyBy(
-            fn (array $item) =>
-                (int) $item['user_id']
-        );
+        $seenUserIds = [];
+        $seenManualNames = [];
+        $seenAllocationIds = [];
 
-        foreach (
-            $requestedAllocations->keys()
-            as $requestedUserId
-        ) {
-            if (
-                !in_array(
-                    (int) $requestedUserId,
+        $allocationRows = collect(
+            $validated['allocations']
+        )
+            ->values()
+            ->map(
+                function (
+                    array $item,
+                    int $index
+                ) use (
                     $validUserIds,
-                    true
-                )
-            ) {
-                throw ValidationException::withMessages([
-                    'allocations' =>
-                        'One or more selected users are not members of this plan.',
-                ]);
-            }
-        }
+                    &$seenUserIds,
+                    &$seenManualNames,
+                    &$seenAllocationIds
+                ): array {
+                    $userId = isset($item['user_id'])
+                        ? (int) $item['user_id']
+                        : null;
+
+                    $manualName = isset($item['manual_name'])
+                        ? trim((string) $item['manual_name'])
+                        : '';
+
+                    $allocationIdValue =
+                        $item['id'] ??
+                        $item['allocation_id'] ??
+                        null;
+
+                    $allocationId = $allocationIdValue === null
+                        ? null
+                        : (int) $allocationIdValue;
+
+                    if (
+                        $userId !== null &&
+                        $manualName !== ''
+                    ) {
+                        throw ValidationException::withMessages([
+                            "allocations.{$index}" =>
+                                'Choose a plan member or enter another person, not both.',
+                        ]);
+                    }
+
+                    if (
+                        $userId === null &&
+                        $manualName === ''
+                    ) {
+                        throw ValidationException::withMessages([
+                            "allocations.{$index}" =>
+                                'Select a plan member or enter a name.',
+                        ]);
+                    }
+
+                    if ($userId !== null) {
+                        if (
+                            !in_array(
+                                $userId,
+                                $validUserIds,
+                                true
+                            )
+                        ) {
+                            throw ValidationException::withMessages([
+                                "allocations.{$index}.user_id" =>
+                                    'The selected user is not a member of this plan.',
+                            ]);
+                        }
+
+                        if (
+                            in_array(
+                                $userId,
+                                $seenUserIds,
+                                true
+                            )
+                        ) {
+                            throw ValidationException::withMessages([
+                                "allocations.{$index}.user_id" =>
+                                    'The same plan member was added more than once.',
+                            ]);
+                        }
+
+                        $seenUserIds[] = $userId;
+                        $manualName = '';
+                        $allocationId = null;
+                    } else {
+                        $manualKey = strtolower($manualName);
+
+                        if (
+                            in_array(
+                                $manualKey,
+                                $seenManualNames,
+                                true
+                            )
+                        ) {
+                            throw ValidationException::withMessages([
+                                "allocations.{$index}.manual_name" =>
+                                    'The same manually added person appears more than once.',
+                            ]);
+                        }
+
+                        $seenManualNames[] = $manualKey;
+
+                        if ($allocationId !== null) {
+                            if (
+                                in_array(
+                                    $allocationId,
+                                    $seenAllocationIds,
+                                    true
+                                )
+                            ) {
+                                throw ValidationException::withMessages([
+                                    "allocations.{$index}.id" =>
+                                        'The same budget allocation appears more than once.',
+                                ]);
+                            }
+
+                            $seenAllocationIds[] = $allocationId;
+                        }
+                    }
+
+                    return [
+                        'allocation_id' => $allocationId,
+                        'user_id' => $userId,
+                        'manual_name' => $manualName === ''
+                            ? null
+                            : $manualName,
+                        'is_included' =>
+                            (bool) $item['is_included'],
+                        'planned_share_cents' =>
+                            $this->toCents(
+                                $item['planned_share'] ?? 0
+                            ),
+                    ];
+                }
+            )
+            ->values();
 
         $expenseRows = collect(
             $validated['expenses']
@@ -425,45 +726,6 @@ class PlanBudgetController extends Controller
                     )
             );
 
-        /*
-         * Every actual plan member is represented.
-         *
-         * Members missing from the request are treated
-         * as excluded instead of disappearing.
-         */
-        $allocationRows = $planUsers
-            ->values()
-            ->map(
-                function ($user) use (
-                    $requestedAllocations
-                ): array {
-                    $requested =
-                        $requestedAllocations->get(
-                            (int) $user->id
-                        );
-
-                    return [
-                        'user_id' =>
-                            (int) $user->id,
-
-                        'is_included' =>
-                            (bool) (
-                                $requested[
-                                    'is_included'
-                                ] ?? false
-                            ),
-
-                        'planned_share_cents' =>
-                            $this->toCents(
-                                $requested[
-                                    'planned_share'
-                                ] ?? 0
-                            ),
-                    ];
-                }
-            )
-            ->values();
-
         $includedIndexes =
             $allocationRows
                 ->keys()
@@ -478,77 +740,81 @@ class PlanBudgetController extends Controller
         if ($includedIndexes->isEmpty()) {
             throw ValidationException::withMessages([
                 'allocations' =>
-                    'Include at least one plan member in the budget.',
+                    'Add at least one person to the budget.',
             ]);
         }
 
         if ($validated['split_type'] === 'equal') {
-    $includedCount = $includedIndexes->count();
+            $includedCount = $includedIndexes->count();
 
-    $baseShare = intdiv(
-        $totalEstimatedCents,
-        $includedCount
-    );
+            $baseShare = intdiv(
+                $totalEstimatedCents,
+                $includedCount
+            );
 
-    $remainingCents =
-        $totalEstimatedCents % $includedCount;
+            $remainingCents =
+                $totalEstimatedCents % $includedCount;
 
-    $includedPosition = 0;
+            $includedPosition = 0;
 
-    $allocationRows = $allocationRows
-        ->map(function (array $row) use (
-            $baseShare,
-            $remainingCents,
-            &$includedPosition
-        ): array {
-            if (!$row['is_included']) {
-                $row['planned_share_cents'] = 0;
+            $allocationRows = $allocationRows
+                ->map(
+                    function (array $row) use (
+                        $baseShare,
+                        $remainingCents,
+                        &$includedPosition
+                    ): array {
+                        if (!$row['is_included']) {
+                            $row['planned_share_cents'] = 0;
 
-                return $row;
+                            return $row;
+                        }
+
+                        $extraCent =
+                            $includedPosition < $remainingCents
+                                ? 1
+                                : 0;
+
+                        $row['planned_share_cents'] =
+                            $baseShare + $extraCent;
+
+                        $includedPosition++;
+
+                        return $row;
+                    }
+                )
+                ->values();
+        } else {
+            $allocationRows = $allocationRows
+                ->map(
+                    function (array $row): array {
+                        if (!$row['is_included']) {
+                            $row['planned_share_cents'] = 0;
+                        }
+
+                        return $row;
+                    }
+                )
+                ->values();
+
+            $allocatedCents = $allocationRows->sum(
+                fn (array $row) =>
+                    $row['is_included']
+                        ? $row['planned_share_cents']
+                        : 0
+            );
+
+            if ($allocatedCents > $totalEstimatedCents) {
+                $excess = $this->fromCents(
+                    $allocatedCents - $totalEstimatedCents
+                );
+
+                throw ValidationException::withMessages([
+                    'allocations' =>
+                        "Custom allocations cannot exceed the estimated budget. Excess: {$excess}",
+                ]);
             }
-
-            $extraCent =
-                $includedPosition < $remainingCents
-                    ? 1
-                    : 0;
-
-            $row['planned_share_cents'] =
-                $baseShare + $extraCent;
-
-            $includedPosition++;
-
-            return $row;
-        })
-        ->values();
-} else {
-    $allocationRows = $allocationRows
-        ->map(function (array $row): array {
-            if (!$row['is_included']) {
-                $row['planned_share_cents'] = 0;
-            }
-
-            return $row;
-        })
-        ->values();
-
-    $allocatedCents = $allocationRows->sum(
-        fn (array $row) =>
-            $row['is_included']
-                ? $row['planned_share_cents']
-                : 0
-    );
-
-    if ($allocatedCents !== $totalEstimatedCents) {
-        $difference = $this->fromCents(
-            $totalEstimatedCents - $allocatedCents
-        );
-
-        throw ValidationException::withMessages([
-            'allocations' =>
-                "Custom allocations must match the estimated budget. Difference: {$difference}",
-        ]);
-    }
-}
+        }
 
         return DB::transaction(
             function () use (
@@ -558,8 +824,7 @@ class PlanBudgetController extends Controller
                 $validated,
                 $expenseRows,
                 $allocationRows,
-                $totalEstimatedCents,
-                $validUserIds
+                $totalEstimatedCents
             ): PlanBudget {
                 if ($budget === null) {
                     $budget =
@@ -589,6 +854,9 @@ class PlanBudgetController extends Controller
 
                             'published_at' =>
                                 now(),
+
+                            'needs_review' =>
+                                false,
                         ]);
                 } else {
                     $budget->update([
@@ -606,13 +874,26 @@ class PlanBudgetController extends Controller
                             $this->fromCents(
                                 $totalEstimatedCents
                             ),
+
+                        'needs_review' =>
+                            false,
+
+                        'review_reason' =>
+                            null,
+
+                        'review_context' =>
+                            null,
+
+                        'reviewed_at' =>
+                            now(),
+
+                        'reviewed_by' =>
+                            $request
+                                ->user()
+                                ->id,
                     ]);
                 }
 
-                /*
-                 * Replace the expense list with the
-                 * newly submitted ordered list.
-                 */
                 $budget
                     ->expenses()
                     ->delete();
@@ -623,24 +904,69 @@ class PlanBudgetController extends Controller
                         $expenseRows->all()
                     );
 
+                $keptAllocationIds = [];
+
                 foreach (
                     $allocationRows
                     as $row
                 ) {
-                    $existing =
-                        $budget
+                    if ($row['user_id'] !== null) {
+                        /*
+                         * Find by user_id even when the existing
+                         * allocation was previously marked Former Member.
+                         * Re-adding the same user safely reactivates it.
+                         */
+                        $existing = $budget
                             ->allocations()
                             ->where(
                                 'user_id',
                                 $row['user_id']
                             )
                             ->first();
+                    } elseif (
+                        $row['allocation_id'] !== null
+                    ) {
+                        $existing = $budget
+                            ->allocations()
+                            ->whereKey(
+                                $row['allocation_id']
+                            )
+                            ->whereNull('user_id')
+                            ->where(
+                                'is_former_member',
+                                false
+                            )
+                            ->first();
+
+                        if ($existing === null) {
+                            throw ValidationException::withMessages([
+                                'allocations' =>
+                                    'One of the manually added people is no longer available. Reload the budget and try again.',
+                            ]);
+                        }
+                    } else {
+                        $existing = null;
+                    }
 
                     $newPlannedShare =
                         $this->fromCents(
                             $row[
                                 'planned_share_cents'
                             ]
+                        );
+
+                    $manualNameChanged =
+                        $existing !== null &&
+                        trim(
+                            (string) $existing
+                                ->manual_name
+                        ) !==
+                        trim(
+                            (string) (
+                                $row[
+                                    'manual_name'
+                                ] ?? ''
+                            )
                         );
 
                     $shareChanged =
@@ -657,10 +983,19 @@ class PlanBudgetController extends Controller
                                 ->is_included !==
                                 (bool) $row[
                                     'is_included'
-                                ]
+                                ] ||
+                            (bool) $existing
+                                ->is_former_member ||
+                            $manualNameChanged
                         );
 
                     $payload = [
+                        'user_id' =>
+                            $row['user_id'],
+
+                        'manual_name' =>
+                            $row['manual_name'],
+
                         'is_included' =>
                             $row[
                                 'is_included'
@@ -668,12 +1003,17 @@ class PlanBudgetController extends Controller
 
                         'planned_share' =>
                             $newPlannedShare,
+
+                        'is_former_member' =>
+                            false,
+
+                        'former_member_name' =>
+                            null,
+
+                        'member_left_at' =>
+                            null,
                     ];
 
-                    /*
-                     * If a member's amount or inclusion
-                     * changes, reset Paid back to Unpaid.
-                     */
                     if (
                         $shareChanged ||
                         !$row['is_included']
@@ -689,30 +1029,45 @@ class PlanBudgetController extends Controller
                         ] = null;
                     }
 
-                    $budget
-                        ->allocations()
-                        ->updateOrCreate(
-                            [
-                                'user_id' =>
-                                    $row[
-                                        'user_id'
-                                    ],
-                            ],
-                            $payload
-                        );
+                    if ($existing === null) {
+                        $savedAllocation = $budget
+                            ->allocations()
+                            ->create($payload);
+                    } else {
+                        $existing->update($payload);
+
+                        $savedAllocation =
+                            $existing->fresh();
+                    }
+
+                    $keptAllocationIds[] =
+                        (int) $savedAllocation->id;
                 }
 
                 /*
-                 * Remove allocations for users who are
-                 * no longer members of the plan.
+                 * Anything removed from the current budget list
+                 * is removed only from the budget. The user stays
+                 * a member of the plan and can be added back later.
+                 *
+                 * Former-member history is never deleted here.
                  */
-                $budget
+                $activeAllocations = $budget
                     ->allocations()
-                    ->whereNotIn(
-                        'user_id',
-                        $validUserIds
-                    )
-                    ->delete();
+                    ->where(
+                        'is_former_member',
+                        false
+                    );
+
+                if (empty($keptAllocationIds)) {
+                    $activeAllocations->delete();
+                } else {
+                    $activeAllocations
+                        ->whereNotIn(
+                            'id',
+                            $keptAllocationIds
+                        )
+                        ->delete();
+                }
 
                 return $budget->fresh();
             }
@@ -727,6 +1082,7 @@ class PlanBudgetController extends Controller
         $budget->load([
             'creator',
             'updater',
+            'reviewer',
             'expenses',
             'allocations.user',
             'allocations.markedPaidBy',
@@ -750,18 +1106,30 @@ class PlanBudgetController extends Controller
             );
 
         $allocatedCents = 0;
-        $collectedCents = 0;
+        $activeCollectedCents = 0;
+        $formerCollectedCents = 0;
 
         $allocations = $budget
             ->allocations
             ->sortBy(
                 fn (
                     BudgetAllocation $allocation
-                ) => strtolower(
-                    (string) (
-                        $allocation
-                            ->user
-                            ?->name ?? ''
+                ) => sprintf(
+                    '%d-%s',
+                    $allocation->is_former_member
+                        ? 1
+                        : 0,
+                    strtolower(
+                        (string) (
+                            $allocation
+                                ->former_member_name ??
+                            $allocation
+                                ->manual_name ??
+                            $allocation
+                                ->user
+                                ?->name ??
+                            ''
+                        )
                     )
                 )
             )
@@ -776,7 +1144,8 @@ class PlanBudgetController extends Controller
                     $canSeeAllStatuses,
                     $plan,
                     &$allocatedCents,
-                    &$collectedCents
+                    &$activeCollectedCents,
+                    &$formerCollectedCents
                 ): array {
                     $plannedShareCents =
                         $this->toCents(
@@ -785,6 +1154,8 @@ class PlanBudgetController extends Controller
                         );
 
                     if (
+                        !$allocation
+                            ->is_former_member &&
                         $allocation
                             ->is_included
                     ) {
@@ -795,9 +1166,17 @@ class PlanBudgetController extends Controller
                             $allocation
                                 ->is_paid
                         ) {
-                            $collectedCents +=
+                            $activeCollectedCents +=
                                 $plannedShareCents;
                         }
+                    } elseif (
+                        $allocation
+                            ->is_former_member &&
+                        $allocation
+                            ->is_paid
+                    ) {
+                        $formerCollectedCents +=
+                            $plannedShareCents;
                     }
 
                     $isOwnAllocation =
@@ -828,8 +1207,22 @@ class PlanBudgetController extends Controller
 
                         'name' =>
                             $allocation
+                                ->former_member_name ??
+                            $allocation
+                                ->manual_name ??
+                            $allocation
                                 ->user
                                 ?->name,
+
+                        'manual_name' =>
+                            $allocation
+                                ->manual_name,
+
+                        'is_manual' =>
+                            !$allocation
+                                ->is_former_member &&
+                            $allocation
+                                ->user_id === null,
 
                         'username' =>
                             $allocation
@@ -842,10 +1235,24 @@ class PlanBudgetController extends Controller
                                 ?->profile_photo_url,
 
                         'is_plan_admin' =>
+                            !$allocation
+                                ->is_former_member &&
+                            $allocation
+                                ->user_id !== null &&
                             (int) $allocation
                                 ->user_id ===
                             (int) $plan
                                 ->admin_id,
+
+                        'is_former_member' =>
+                            (bool) $allocation
+                                ->is_former_member,
+
+                        'member_left_at' =>
+                            optional(
+                                $allocation
+                                    ->member_left_at
+                            )->toISOString(),
 
                         'is_included' =>
                             (bool) $allocation
@@ -889,6 +1296,8 @@ class PlanBudgetController extends Controller
                             (bool) (
                                 $budget
                                     ->contribution_tracking_enabled &&
+                                !$allocation
+                                    ->is_former_member &&
                                 $allocation
                                     ->is_included &&
                                 (
@@ -904,12 +1313,40 @@ class PlanBudgetController extends Controller
                 }
             );
 
+        $collectedCents =
+            $activeCollectedCents +
+            $formerCollectedCents;
+
         return [
             'id' => $budget->id,
             'plan_id' => $budget->plan_id,
 
             'split_type' =>
                 $budget->split_type,
+
+            'needs_review' =>
+                (bool) $budget->needs_review,
+
+            'review_reason' =>
+                $budget->review_reason,
+
+            'review_context' =>
+                $budget->review_context,
+
+            'reviewed_at' =>
+                optional(
+                    $budget->reviewed_at
+                )->toISOString(),
+
+            'reviewed_by' =>
+                $budget->reviewer
+                    ? [
+                        'id' =>
+                            $budget->reviewer->id,
+                        'name' =>
+                            $budget->reviewer->name,
+                    ]
+                    : null,
 
             'is_published' =>
                 $budget->published_at !== null,
@@ -943,8 +1380,11 @@ class PlanBudgetController extends Controller
 
                 'unallocated_amount' =>
                     (float) $this->fromCents(
-                        $estimatedCents -
-                        $allocatedCents
+                        max(
+                            $estimatedCents -
+                            $allocatedCents,
+                            0
+                        )
                     ),
 
                 'collected_amount' =>
@@ -952,10 +1392,20 @@ class PlanBudgetController extends Controller
                         $collectedCents
                     ),
 
+                'active_collected_amount' =>
+                    (float) $this->fromCents(
+                        $activeCollectedCents
+                    ),
+
+                'former_collected_amount' =>
+                    (float) $this->fromCents(
+                        $formerCollectedCents
+                    ),
+
                 'not_collected_amount' =>
                     (float) $this->fromCents(
                         max(
-                            $allocatedCents -
+                            $estimatedCents -
                             $collectedCents,
                             0
                         )
