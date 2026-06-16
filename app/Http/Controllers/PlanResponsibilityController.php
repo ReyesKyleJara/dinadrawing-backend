@@ -9,6 +9,7 @@ use App\Models\PlanResponsibilityAssignment;
 use App\Models\PlanResponsibilityItem;
 use App\Models\User;
 use App\Services\ActivityNotifier;
+use App\Services\EmailReminderService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
@@ -363,6 +364,12 @@ class PlanResponsibilityController extends Controller
                 $plan,
                 (int) $user->id,
                 'responsibility_finalized'
+            );
+
+            $this->emailResponsibilityParticipants(
+                $post,
+                $plan,
+                (int) $user->id
             );
         } else {
             $this->notifyResponsibilityParticipants(
@@ -1363,6 +1370,19 @@ class PlanResponsibilityController extends Controller
                     replaceExisting: true,
                 );
 
+
+                EmailReminderService::sendAssignmentNotification(
+                    user: $member,
+                    planName: (string) $plan->title,
+                    taskDescription: (string) $createdItem->title,
+                    actionUrl: EmailReminderService::planActionUrl(
+                        (int) $plan->id
+                    ),
+                    reminderKey:
+                        'responsibility-item:' .
+                        $createdItem->id . ':direct'
+                );
+
                 return $createdItem;
             }
 
@@ -1830,6 +1850,23 @@ class PlanResponsibilityController extends Controller
             ],
             'read_at' => null,
         ]);
+
+
+        $assignedUser = User::find($assignment->user_id);
+
+        if ($assignedUser !== null) {
+            EmailReminderService::sendAssignmentNotification(
+                user: $assignedUser,
+                planName: (string) $plan->title,
+                taskDescription: (string) $item->title,
+                actionUrl: EmailReminderService::planActionUrl(
+                    (int) $plan->id
+                ),
+                reminderKey:
+                    'responsibility-assignment:' .
+                    $assignment->id . ':pending'
+            );
+        }
     }
 
     private function resolvePendingAssignmentNotification(
@@ -2003,6 +2040,61 @@ class PlanResponsibilityController extends Controller
             notificationKey: 'responsibility:' . $post->id . ':' . $type,
             replaceExisting: true,
         );
+    }
+
+    private function emailResponsibilityParticipants(
+        PlanPost $post,
+        Plan $plan,
+        int $actorUserId
+    ): void {
+        $post->loadMissing([
+            'responsibilityItems.member',
+            'responsibilityItems.assignments.user',
+        ]);
+
+        $users = collect();
+
+        foreach ($post->responsibilityItems as $item) {
+            if (
+                $item->member !== null &&
+                (int) $item->member->id !== $actorUserId
+            ) {
+                $users->put((int) $item->member->id, $item->member);
+            }
+
+            foreach ($item->assignments as $assignment) {
+                if (
+                    $assignment->user !== null &&
+                    in_array($assignment->status, ['pending', 'accepted'], true) &&
+                    (int) $assignment->user->id !== $actorUserId
+                ) {
+                    $users->put(
+                        (int) $assignment->user->id,
+                        $assignment->user
+                    );
+                }
+            }
+        }
+
+        $details = (string) (
+            $post->responsibility_title
+            ?? $post->content
+            ?? 'Who Does What'
+        );
+
+        foreach ($users as $recipient) {
+            EmailReminderService::sendAssignmentFinalized(
+                user: $recipient,
+                planName: (string) $plan->title,
+                details: $details,
+                actionUrl: EmailReminderService::planActionUrl(
+                    (int) $plan->id
+                ),
+                reminderKey:
+                    'responsibility:' . $post->id .
+                    ':finalized:user:' . $recipient->id
+            );
+        }
     }
 
     private function formatResponsibilityPost(

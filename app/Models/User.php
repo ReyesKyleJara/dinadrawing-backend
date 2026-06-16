@@ -16,20 +16,22 @@ class User extends Authenticatable
         'username',
         'email',
         'password',
-
-        // Profile settings
+        'email_verified_at',
         'profile_photo_path',
         'username_changed_at',
-
-        // Notification preferences
         'email_reminders',
+        'email_reminders_enabled_at',
         'push_notifications',
         'in_app_alerts',
+        'oauth_provider',
+        'oauth_uid',
+        'oauth_avatar_url',
     ];
 
     protected $hidden = [
         'password',
         'remember_token',
+        'oauth_uid',
     ];
 
     protected function casts(): array
@@ -37,18 +39,14 @@ class User extends Authenticatable
         return [
             'email_verified_at' => 'datetime',
             'username_changed_at' => 'datetime',
-
+            'email_reminders_enabled_at' => 'datetime',
             'email_reminders' => 'boolean',
             'push_notifications' => 'boolean',
             'in_app_alerts' => 'boolean',
-
             'password' => 'hashed',
         ];
     }
 
-    /**
-     * Person-based responsibility entries connected to this user.
-     */
     public function responsibilityItems(): HasMany
     {
         return $this->hasMany(
@@ -57,9 +55,6 @@ class User extends Authenticatable
         );
     }
 
-    /**
-     * Role/task assignments claimed or assigned to this user.
-     */
     public function responsibilityAssignments(): HasMany
     {
         return $this->hasMany(
@@ -68,68 +63,53 @@ class User extends Authenticatable
         );
     }
 
-    public function createdPlanBudgets()
-{
-    return $this->hasMany(
-        PlanBudget::class,
-        'created_by'
-    );
-}
+    public function createdPlanBudgets(): HasMany
+    {
+        return $this->hasMany(PlanBudget::class, 'created_by');
+    }
 
-public function budgetAllocations()
-{
-    return $this->hasMany(
-        BudgetAllocation::class,
-        'user_id'
-    );
-}
+    public function budgetAllocations(): HasMany
+    {
+        return $this->hasMany(BudgetAllocation::class, 'user_id');
+    }
 
-public function markedBudgetPayments()
-{
-    return $this->hasMany(
-        BudgetAllocation::class,
-        'marked_paid_by'
-    );
-}
+    public function markedBudgetPayments(): HasMany
+    {
+        return $this->hasMany(BudgetAllocation::class, 'marked_paid_by');
+    }
 
-public function receivedPlanInvitations()
-{
-    return $this->hasMany(
-        PlanInvitation::class,
-        'invited_user_id'
-    );
-}
+    public function receivedPlanInvitations(): HasMany
+    {
+        return $this->hasMany(PlanInvitation::class, 'invited_user_id');
+    }
 
-public function sentPlanInvitations()
-{
-    return $this->hasMany(
-        PlanInvitation::class,
-        'invited_by'
-    );
-}
+    public function sentPlanInvitations(): HasMany
+    {
+        return $this->hasMany(PlanInvitation::class, 'invited_by');
+    }
 
-public function planPostComments()
-{
-    return $this->hasMany(
-        PlanPostComment::class,
-        'user_id'
-    );
-}
+    public function planPostComments(): HasMany
+    {
+        return $this->hasMany(PlanPostComment::class, 'user_id');
+    }
 
-public function receivedActivityNotifications()
-{
-    return $this->hasMany(
-        ActivityNotification::class,
-        'recipient_user_id'
-    );
-}
+    public function receivedActivityNotifications(): HasMany
+    {
+        return $this->hasMany(ActivityNotification::class, 'recipient_user_id');
+    }
 
-public function triggeredActivityNotifications()
-{
-    return $this->hasMany(
-        ActivityNotification::class,
-        'actor_user_id'
-    );
-}
+    public function triggeredActivityNotifications(): HasMany
+    {
+        return $this->hasMany(ActivityNotification::class, 'actor_user_id');
+    }
 
+    public function emailVerificationCodes(): HasMany
+    {
+        return $this->hasMany(EmailVerificationCode::class);
+    }
+
+    public function emailReminderLogs(): HasMany
+    {
+        return $this->hasMany(EmailReminderLog::class);
+    }
 }

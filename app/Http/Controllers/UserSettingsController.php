@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\User;
 use App\Services\ActivityNotifier;
+use App\Services\EmailReminderService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
@@ -308,7 +309,8 @@ class UserSettingsController extends Controller
 
         if (
             $validated['email_reminders'] === true &&
-            $user->email_verified_at === null
+            $user->email_verified_at === null &&
+            trim((string) $user->oauth_provider) === ''
         ) {
             return response()->json([
                 'success' => false,
@@ -322,8 +324,11 @@ class UserSettingsController extends Controller
             ], 422);
         }
 
-        $user->email_reminders =
-            $validated['email_reminders'];
+        if ($validated['email_reminders'] === true) {
+            EmailReminderService::enableEmailReminders($user);
+        } else {
+            EmailReminderService::disableEmailReminders($user);
+        }
 
         $user->push_notifications =
             $validated['push_notifications'];
@@ -512,11 +517,18 @@ class UserSettingsController extends Controller
             );
         }
 
+        if ($photoUrl === null &&
+            is_string($user->oauth_avatar_url) &&
+            trim($user->oauth_avatar_url) !== '') {
+            $photoUrl = $user->oauth_avatar_url;
+        }
+
         return [
             'id' => $user->id,
             'name' => $user->name,
             'username' => $user->username,
             'email' => $user->email,
+            'oauth_provider' => $user->oauth_provider,
 
             'email_verified' =>
                 $user->email_verified_at !== null,

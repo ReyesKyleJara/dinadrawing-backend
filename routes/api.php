@@ -20,6 +20,9 @@ Route::get('/test', function () {
 
 Route::post('/register', [AuthController::class, 'register']);
 Route::post('/login', [AuthController::class, 'login']);
+Route::post('/google-login', [AuthController::class, 'googleLogin']);
+Route::post('/verify-email', [AuthController::class, 'verifyEmail']);
+Route::post('/resend-verification-code', [AuthController::class, 'resendVerificationCode']);
 
 // Public because it is also used during Sign Up.
 Route::post('/check-username', [UserSettingsController::class, 'checkUsername']);
@@ -30,6 +33,7 @@ Route::middleware('auth:sanctum')->group(function () {
     });
 
     Route::post('/logout', [AuthController::class, 'logout']);
+    Route::post('/enable-email-reminders', [AuthController::class, 'enableEmailReminders']);
 
     // User Profile and Settings
     Route::get('/user/settings', [UserSettingsController::class, 'show']);
