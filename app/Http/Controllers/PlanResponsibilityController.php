@@ -2,11 +2,13 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\ActivityNotification;
 use App\Models\Plan;
 use App\Models\PlanPost;
 use App\Models\PlanResponsibilityAssignment;
 use App\Models\PlanResponsibilityItem;
 use App\Models\User;
+use App\Services\ActivityNotifier;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
@@ -134,7 +136,8 @@ class PlanResponsibilityController extends Controller
             $this->createResponsibilityItems(
                 $post,
                 $plan,
-                $validated['items']
+                $validated['items'],
+                (int) $user->id
             );
 
             return $post;
@@ -303,6 +306,13 @@ class PlanResponsibilityController extends Controller
             }
         });
 
+        $this->notifyResponsibilityParticipants(
+            $post->fresh(),
+            $plan,
+            (int) $user->id,
+            'responsibility_updated'
+        );
+
         return response()->json([
             'message' =>
                 'Responsibilities updated successfully.',
@@ -338,6 +348,30 @@ class PlanResponsibilityController extends Controller
             'responsibility_is_finalized' =>
                 $validated['is_finalized'],
         ]);
+
+        if ($post->responsibility_is_finalized) {
+            ActivityNotifier::deleteForPostByTypes(
+                (int) $post->id,
+                [
+                    'responsibility_assignment_pending',
+                    'responsibility_direct_assigned',
+                ]
+            );
+
+            $this->notifyResponsibilityParticipants(
+                $post,
+                $plan,
+                (int) $user->id,
+                'responsibility_finalized'
+            );
+        } else {
+            $this->notifyResponsibilityParticipants(
+                $post,
+                $plan,
+                (int) $user->id,
+                'responsibility_reopened'
+            );
+        }
 
         return response()->json([
             'message' =>
@@ -451,7 +485,8 @@ class PlanResponsibilityController extends Controller
         DB::transaction(function () use (
             $post,
             $plan,
-            $validated
+            $validated,
+            $user
         ) {
             $position =
                 $post->responsibilityItems()->count();
@@ -460,9 +495,28 @@ class PlanResponsibilityController extends Controller
                 $post,
                 $plan,
                 $validated,
-                $position
+                $position,
+                (int) $user->id
             );
         });
+
+        ActivityNotifier::notifyPlan(
+            plan: $plan,
+            actorUserId: (int) $user->id,
+            type: 'responsibility_item_added',
+            data: [
+                'activity_tab' => 'notifications',
+                'requires_action' => false,
+                'responsibility_title' => (string) (
+                    $post->responsibility_title
+                    ?? $post->content
+                    ?? 'Who Does What'
+                ),
+                'item_title' => (string) $validated['title'],
+            ],
+            planPostId: (int) $post->id,
+            excludeUserId: (int) $user->id,
+        );
 
         return response()->json([
             'message' => 'Item added successfully.',
@@ -546,6 +600,32 @@ class PlanResponsibilityController extends Controller
                 )
             ),
         ]);
+
+        ActivityNotifier::resolveByKey(
+            'responsibility:item:' . $item->id . ':direct',
+            'responsibility_progress_updated_by_you',
+            [
+                'responsibility_title' => (string) (
+                    $post->responsibility_title
+                    ?? $post->content
+                    ?? 'Who Does What'
+                ),
+                'item_title' => (string) $item->title,
+            ],
+            (int) $user->id,
+            true
+        );
+
+        $this->notifyResponsibilityManagers(
+            $post,
+            $plan,
+            (int) $user->id,
+            'responsibility_progress_updated',
+            [
+                'item_title' => (string) $item->title,
+                'contribution' => (string) $item->contribution,
+            ]
+        );
 
         return response()->json([
             'message' =>
@@ -633,17 +713,29 @@ class PlanResponsibilityController extends Controller
             $existing->update([
                 'status' => 'accepted',
                 'source' => 'claimed',
+                'assigned_by_user_id' => null,
                 'manual_name' => null,
             ]);
         } else {
             PlanResponsibilityAssignment::create([
                 'responsibility_item_id' => $item->id,
                 'user_id' => $user->id,
+                'assigned_by_user_id' => null,
                 'manual_name' => null,
                 'status' => 'accepted',
                 'source' => 'claimed',
             ]);
         }
+
+        $this->notifyResponsibilityManagers(
+            $post,
+            $plan,
+            (int) $user->id,
+            'responsibility_claimed',
+            [
+                'item_title' => (string) $item->title,
+            ]
+        );
 
         return response()->json([
             'message' =>
@@ -699,6 +791,16 @@ class PlanResponsibilityController extends Controller
             $assignment->delete();
         }
 
+        $this->notifyResponsibilityManagers(
+            $post,
+            $plan,
+            (int) $user->id,
+            'responsibility_unclaimed',
+            [
+                'item_title' => (string) $item->title,
+            ]
+        );
+
         return response()->json([
             'message' =>
                 'Responsibility unclaimed successfully.',
@@ -752,13 +854,75 @@ class PlanResponsibilityController extends Controller
             ], 422);
         }
 
-        $assignment->update([
-            'status' => $validated['response'],
-        ]);
+        $responseValue = (string) $validated['response'];
+
+        DB::transaction(function () use (
+            $assignment,
+            $responseValue,
+            $user,
+            $item,
+            $post,
+            $plan
+        ): void {
+            $assignment->update([
+                'status' => $responseValue,
+            ]);
+
+            $this->resolvePendingAssignmentNotification(
+                $assignment,
+                $responseValue
+            );
+
+            $recipientUserId =
+                $assignment->assigned_by_user_id
+                ?? $post->user_id
+                ?? $plan->admin_id;
+
+            if (
+                $recipientUserId !== null &&
+                (int) $recipientUserId !== (int) $user->id
+            ) {
+                ActivityNotification::create([
+                    'recipient_user_id' =>
+                        (int) $recipientUserId,
+                    'actor_user_id' =>
+                        (int) $user->id,
+                    'type' =>
+                        $responseValue === 'accepted'
+                            ? 'responsibility_assignment_accepted'
+                            : 'responsibility_assignment_declined',
+                    'plan_id' =>
+                        (int) $plan->id,
+                    'plan_post_id' =>
+                        (int) $post->id,
+                    'plan_post_comment_id' => null,
+                    'data' => [
+                        'activity_tab' => 'notifications',
+                        'requires_action' => false,
+                        'responsibility_item_id' =>
+                            (int) $item->id,
+                        'assignment_id' =>
+                            (int) $assignment->id,
+                        'responsibility_title' =>
+                            (string) (
+                                $post->responsibility_title
+                                ?? $post->content
+                                ?? 'Responsibilities'
+                            ),
+                        'item_title' =>
+                            (string) $item->title,
+                        'response' => $responseValue,
+                        'can_reassign' =>
+                            $responseValue === 'declined',
+                    ],
+                    'read_at' => null,
+                ]);
+            }
+        });
 
         return response()->json([
             'message' =>
-                $validated['response'] === 'accepted'
+                $responseValue === 'accepted'
                     ? 'Assignment accepted successfully.'
                     : 'Assignment declined successfully.',
 
@@ -869,23 +1033,49 @@ class PlanResponsibilityController extends Controller
                 ], 422);
             }
 
-            if ($existing) {
-                $existing->update([
-                    'status' => 'pending',
-                    'source' => 'preassigned',
-                    'manual_name' => null,
-                ]);
-            } else {
-                PlanResponsibilityAssignment::create([
-                    'responsibility_item_id' =>
-                        $item->id,
-                    'user_id' =>
-                        $assignedUser->id,
-                    'manual_name' => null,
-                    'status' => 'pending',
-                    'source' => 'preassigned',
-                ]);
-            }
+            DB::transaction(
+                function () use (
+                    $existing,
+                    $item,
+                    $assignedUser,
+                    $user,
+                    $post,
+                    $plan
+                ): void {
+                    if ($existing) {
+                        $existing->update([
+                            'status' => 'pending',
+                            'source' => 'preassigned',
+                            'assigned_by_user_id' =>
+                                (int) $user->id,
+                            'manual_name' => null,
+                        ]);
+
+                        $assignment = $existing->fresh();
+                    } else {
+                        $assignment =
+                            PlanResponsibilityAssignment::create([
+                                'responsibility_item_id' =>
+                                    $item->id,
+                                'user_id' =>
+                                    $assignedUser->id,
+                                'assigned_by_user_id' =>
+                                    (int) $user->id,
+                                'manual_name' => null,
+                                'status' => 'pending',
+                                'source' => 'preassigned',
+                            ]);
+                    }
+
+                    $this->createPendingAssignmentNotification(
+                        $assignment,
+                        $item,
+                        $post,
+                        $plan,
+                        (int) $user->id
+                    );
+                }
+            );
         } else {
             $manualName = trim(
                 (string) $validated['manual_name']
@@ -921,6 +1111,8 @@ class PlanResponsibilityController extends Controller
                 'responsibility_item_id' =>
                     $item->id,
                 'user_id' => null,
+                'assigned_by_user_id' =>
+                    (int) $user->id,
                 'manual_name' => $manualName,
                 'status' => 'accepted',
                 'source' => 'preassigned',
@@ -973,7 +1165,18 @@ class PlanResponsibilityController extends Controller
             ], 422);
         }
 
-        $assignment->delete();
+        DB::transaction(function () use (
+            $assignment,
+            $user
+        ): void {
+            $this->resolvePendingAssignmentNotification(
+                $assignment,
+                'removed',
+                (int) $user->id
+            );
+
+            $assignment->delete();
+        });
 
         return response()->json([
             'message' =>
@@ -988,7 +1191,8 @@ class PlanResponsibilityController extends Controller
     private function createResponsibilityItems(
         PlanPost $post,
         Plan $plan,
-        array $items
+        array $items,
+        int $assignedByUserId
     ): void {
         $seenMemberIds = [];
         $seenNames = [];
@@ -1068,7 +1272,8 @@ class PlanResponsibilityController extends Controller
                 $post,
                 $plan,
                 $itemData,
-                $position
+                $position,
+                $assignedByUserId
             );
         }
     }
@@ -1077,7 +1282,8 @@ class PlanResponsibilityController extends Controller
         PlanPost $post,
         Plan $plan,
         array $itemData,
-        int $position
+        int $position,
+        int $assignedByUserId
     ): PlanResponsibilityItem {
         if (
             $post->responsibility_mode ===
@@ -1116,7 +1322,7 @@ class PlanResponsibilityController extends Controller
                     ]);
                 }
 
-                return PlanResponsibilityItem::create([
+                $createdItem = PlanResponsibilityItem::create([
                     'plan_post_id' => $post->id,
                     'member_user_id' => $member->id,
                     'title' => $member->name,
@@ -1129,6 +1335,35 @@ class PlanResponsibilityController extends Controller
                     'slots' => 1,
                     'position' => $position,
                 ]);
+
+                ActivityNotifier::notifyUser(
+                    recipientUserId: (int) $member->id,
+                    actorUserId: (int) $post->user_id,
+                    type: 'responsibility_direct_assigned',
+                    planId: (int) $plan->id,
+                    planPostId: (int) $post->id,
+                    data: [
+                        'activity_tab' => 'action_required',
+                        'requires_action' => true,
+                        'action' => 'view_responsibility',
+                        'responsibility_item_id' =>
+                            (int) $createdItem->id,
+                        'responsibility_title' =>
+                            (string) (
+                                $post->responsibility_title
+                                ?? $post->content
+                                ?? 'Who Does What'
+                            ),
+                        'item_title' =>
+                            (string) $createdItem->title,
+                    ],
+                    notificationKey:
+                        'responsibility:item:' .
+                        $createdItem->id . ':direct',
+                    replaceExisting: true,
+                );
+
+                return $createdItem;
             }
 
             $manualName = trim(
@@ -1251,14 +1486,25 @@ class PlanResponsibilityController extends Controller
                 ]);
             }
 
-            PlanResponsibilityAssignment::create([
-                'responsibility_item_id' =>
-                    $item->id,
-                'user_id' => $member->id,
-                'manual_name' => null,
-                'status' => 'pending',
-                'source' => 'preassigned',
-            ]);
+            $assignment =
+                PlanResponsibilityAssignment::create([
+                    'responsibility_item_id' =>
+                        $item->id,
+                    'user_id' => $member->id,
+                    'assigned_by_user_id' =>
+                        $assignedByUserId,
+                    'manual_name' => null,
+                    'status' => 'pending',
+                    'source' => 'preassigned',
+                ]);
+
+            $this->createPendingAssignmentNotification(
+                $assignment,
+                $item,
+                $post,
+                $plan,
+                $assignedByUserId
+            );
         }
 
         foreach ($manualNames as $name) {
@@ -1266,6 +1512,8 @@ class PlanResponsibilityController extends Controller
                 'responsibility_item_id' =>
                     $item->id,
                 'user_id' => null,
+                'assigned_by_user_id' =>
+                    $assignedByUserId,
                 'manual_name' =>
                     $name['original'],
                 'status' => 'accepted',
@@ -1528,6 +1776,233 @@ class PlanResponsibilityController extends Controller
 
             $item->delete();
         }
+    }
+
+    private function createPendingAssignmentNotification(
+        PlanResponsibilityAssignment $assignment,
+        PlanResponsibilityItem $item,
+        PlanPost $post,
+        Plan $plan,
+        int $actorUserId
+    ): void {
+        if (
+            $assignment->user_id === null ||
+            (int) $assignment->user_id === $actorUserId
+        ) {
+            return;
+        }
+
+        $this->deleteAssignmentNotifications(
+            $assignment,
+            [
+                'responsibility_assignment_pending',
+                'responsibility_assignment_accepted_by_you',
+                'responsibility_assignment_declined_by_you',
+                'responsibility_assignment_removed',
+            ]
+        );
+
+        ActivityNotification::create([
+            'recipient_user_id' =>
+                (int) $assignment->user_id,
+            'actor_user_id' => $actorUserId,
+            'type' =>
+                'responsibility_assignment_pending',
+            'plan_id' => (int) $plan->id,
+            'plan_post_id' => (int) $post->id,
+            'plan_post_comment_id' => null,
+            'data' => [
+                'activity_tab' => 'action_required',
+                'requires_action' => true,
+                'action' => 'review_assignment',
+                'responsibility_item_id' =>
+                    (int) $item->id,
+                'assignment_id' =>
+                    (int) $assignment->id,
+                'responsibility_title' =>
+                    (string) (
+                        $post->responsibility_title
+                        ?? $post->content
+                        ?? 'Responsibilities'
+                    ),
+                'item_title' =>
+                    (string) $item->title,
+            ],
+            'read_at' => null,
+        ]);
+    }
+
+    private function resolvePendingAssignmentNotification(
+        PlanResponsibilityAssignment $assignment,
+        string $resolution,
+        ?int $actorUserId = null
+    ): void {
+        if ($assignment->user_id === null) {
+            return;
+        }
+
+        $notifications = ActivityNotification::query()
+            ->where(
+                'recipient_user_id',
+                (int) $assignment->user_id
+            )
+            ->where(
+                'type',
+                'responsibility_assignment_pending'
+            )
+            ->get();
+
+        foreach ($notifications as $notification) {
+            $data = is_array($notification->data)
+                ? $notification->data
+                : [];
+
+            if (
+                (int) ($data['assignment_id'] ?? 0) !==
+                (int) $assignment->id
+            ) {
+                continue;
+            }
+
+            $resolvedType = match ($resolution) {
+                'accepted' =>
+                    'responsibility_assignment_accepted_by_you',
+                'declined' =>
+                    'responsibility_assignment_declined_by_you',
+                'removed' =>
+                    'responsibility_assignment_removed',
+                default =>
+                    'responsibility_assignment_resolved',
+            };
+
+            $notification->update([
+                'actor_user_id' =>
+                    $actorUserId
+                    ?? $notification->actor_user_id,
+                'type' => $resolvedType,
+                'data' => [
+                    ...$data,
+                    'activity_tab' => 'notifications',
+                    'requires_action' => false,
+                    'resolution' => $resolution,
+                ],
+                'read_at' =>
+                    $notification->read_at ?? now(),
+            ]);
+        }
+    }
+
+    private function deleteAssignmentNotifications(
+        PlanResponsibilityAssignment $assignment,
+        array $types
+    ): void {
+        if ($assignment->user_id === null) {
+            return;
+        }
+
+        $notifications = ActivityNotification::query()
+            ->where(
+                'recipient_user_id',
+                (int) $assignment->user_id
+            )
+            ->whereIn('type', $types)
+            ->get();
+
+        foreach ($notifications as $notification) {
+            $data = is_array($notification->data)
+                ? $notification->data
+                : [];
+
+            if (
+                (int) ($data['assignment_id'] ?? 0) ===
+                (int) $assignment->id
+            ) {
+                $notification->delete();
+            }
+        }
+    }
+
+    private function notifyResponsibilityManagers(
+        PlanPost $post,
+        Plan $plan,
+        int $actorUserId,
+        string $type,
+        array $extraData = []
+    ): void {
+        $recipientIds = collect([
+            (int) $plan->admin_id,
+            (int) $post->user_id,
+        ])->reject(
+            fn ($id) => $id <= 0 || $id === $actorUserId
+        )->unique();
+
+        ActivityNotifier::notifyUsers(
+            recipientUserIds: $recipientIds,
+            actorUserId: $actorUserId,
+            type: $type,
+            planId: (int) $plan->id,
+            planPostId: (int) $post->id,
+            data: [
+                'activity_tab' => 'notifications',
+                'requires_action' => false,
+                'responsibility_title' => (string) (
+                    $post->responsibility_title
+                    ?? $post->content
+                    ?? 'Who Does What'
+                ),
+                ...$extraData,
+            ],
+        );
+    }
+
+    private function notifyResponsibilityParticipants(
+        PlanPost $post,
+        Plan $plan,
+        int $actorUserId,
+        string $type
+    ): void {
+        $post->loadMissing([
+            'responsibilityItems.member',
+            'responsibilityItems.assignments',
+        ]);
+
+        $recipientIds = collect();
+
+        foreach ($post->responsibilityItems as $item) {
+            if ($item->member_user_id !== null) {
+                $recipientIds->push((int) $item->member_user_id);
+            }
+
+            foreach ($item->assignments as $assignment) {
+                if (
+                    $assignment->user_id !== null &&
+                    in_array($assignment->status, ['pending', 'accepted'], true)
+                ) {
+                    $recipientIds->push((int) $assignment->user_id);
+                }
+            }
+        }
+
+        ActivityNotifier::notifyUsers(
+            recipientUserIds: $recipientIds
+                ->reject(fn ($id) => $id === $actorUserId)
+                ->unique(),
+            actorUserId: $actorUserId,
+            type: $type,
+            planId: (int) $plan->id,
+            planPostId: (int) $post->id,
+            data: [
+                'activity_tab' => 'notifications',
+                'requires_action' => false,
+                'responsibility_title' => (string) (
+                    $post->responsibility_title
+                    ?? $post->content
+                    ?? 'Who Does What'
+                ),
+            ],
+            notificationKey: 'responsibility:' . $post->id . ':' . $type,
+            replaceExisting: true,
+        );
     }
 
     private function formatResponsibilityPost(

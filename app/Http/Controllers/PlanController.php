@@ -2,7 +2,10 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\ActivityNotification;
 use App\Models\Plan;
+use App\Models\User;
+use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
@@ -138,13 +141,30 @@ class PlanController extends Controller
             ]);
         }
 
-        $plan->members()->attach($request->user()->id, [
-            'role' => 'member',
-        ]);
+        $joiningUser = $request->user();
+
+        DB::transaction(function () use ($plan, $joiningUser) {
+            $plan->members()->attach($joiningUser->id, [
+                'role' => 'member',
+            ]);
+
+            ActivityNotification::create([
+                'recipient_user_id' => (int) $plan->admin_id,
+                'actor_user_id' => (int) $joiningUser->id,
+                'type' => 'member_joined',
+                'plan_id' => (int) $plan->id,
+                'data' => [
+                    'activity_tab' => 'updates',
+                    'requires_action' => false,
+                    'joined_via' => 'invite_code',
+                ],
+                'read_at' => null,
+            ]);
+        });
 
         return response()->json([
             'message' => 'Joined plan successfully.',
-            'plan' => $plan->load(['admin', 'members']),
+            'plan' => $plan->fresh()->load(['admin', 'members']),
         ]);
     }
 
@@ -176,6 +196,18 @@ class PlanController extends Controller
                 );
 
                 $plan->members()->detach($user->id);
+
+                ActivityNotification::create([
+                    'recipient_user_id' => (int) $plan->admin_id,
+                    'actor_user_id' => (int) $user->id,
+                    'type' => 'member_left',
+                    'plan_id' => (int) $plan->id,
+                    'data' => [
+                        'activity_tab' => 'updates',
+                        'requires_action' => false,
+                    ],
+                    'read_at' => null,
+                ]);
             });
 
             return response()->json([
@@ -226,10 +258,93 @@ class PlanController extends Controller
             ]);
 
             $plan->members()->detach($user->id);
+
+            ActivityNotification::create([
+                'recipient_user_id' => (int) $newAdminId,
+                'actor_user_id' => (int) $user->id,
+                'type' => 'admin_transferred',
+                'plan_id' => (int) $plan->id,
+                'data' => [
+                    'activity_tab' => 'updates',
+                    'requires_action' => false,
+                    'previous_admin_user_id' => (int) $user->id,
+                    'new_admin_user_id' => (int) $newAdminId,
+                ],
+                'read_at' => null,
+            ]);
         });
 
         return response()->json([
             'message' => 'Admin role transferred and you have left the plan successfully.',
+        ]);
+    }
+
+
+    public function removeMember(
+        Request $request,
+        Plan $plan,
+        User $member
+    ) {
+        $currentUser = $request->user();
+
+        if ($plan->is_deleted) {
+            return response()->json([
+                'message' => 'Plan not found.',
+            ], 404);
+        }
+
+        if ((int) $plan->admin_id !== (int) $currentUser->id) {
+            return response()->json([
+                'message' => 'Only the plan admin can remove members.',
+            ], 403);
+        }
+
+        if ((int) $member->id === (int) $currentUser->id) {
+            return response()->json([
+                'message' => 'You cannot remove yourself from the plan.',
+            ], 422);
+        }
+
+        if ((int) $member->id === (int) $plan->admin_id) {
+            return response()->json([
+                'message' => 'The plan admin cannot be removed.',
+            ], 422);
+        }
+
+        $isMember = $plan->members()
+            ->where('users.id', $member->id)
+            ->exists();
+
+        if (!$isMember) {
+            return response()->json([
+                'message' => 'This user is not a member of the plan.',
+            ], 404);
+        }
+
+        DB::transaction(function () use ($plan, $member, $currentUser) {
+            $this->markBudgetForMemberDeparture($plan, $member);
+
+            $plan->members()->detach($member->id);
+
+            ActivityNotification::create([
+                'recipient_user_id' => (int) $member->id,
+                'actor_user_id' => (int) $currentUser->id,
+                'type' => 'member_removed',
+                'plan_id' => (int) $plan->id,
+                'data' => [
+                    'activity_tab' => 'updates',
+                    'requires_action' => false,
+                    'removed_by_user_id' => (int) $currentUser->id,
+                ],
+                'read_at' => null,
+            ]);
+        });
+
+        return response()->json([
+            'message' => 'Member removed successfully.',
+            'removed_user_id' => (int) $member->id,
+            'budget_needs_review' =>
+                (bool) optional($plan->budget)->needs_review,
         ]);
     }
 
@@ -363,11 +478,196 @@ class PlanController extends Controller
             ],
         ]);
 
+        $scheduleChanged =
+            array_key_exists('plan_date', $validated) ||
+            array_key_exists('plan_time', $validated);
+
+        if ($scheduleChanged) {
+            $validated['post_event_checked_at'] = null;
+            $validated['completed_at'] = null;
+            $validated['post_event_prompt_snoozed_until'] = null;
+
+            if (
+                !array_key_exists('status', $validated) &&
+                !empty($validated['plan_date'])
+            ) {
+                $validated['status'] = 'Plan Ongoing';
+            }
+        }
+
         $plan->update($validated);
 
         return response()->json([
             'message' => 'Plan updated successfully.',
             'plan' => $plan->load(['admin', 'members']),
+        ]);
+    }
+
+    public function postEventStatus(Request $request, Plan $plan)
+    {
+        if ($plan->is_deleted) {
+            return response()->json([
+                'message' => 'Plan not found.',
+            ], 404);
+        }
+
+        $user = $request->user();
+        $isPlanAdmin = (int) $plan->admin_id === (int) $user->id;
+        $isMember = $plan->members()
+            ->where('users.id', $user->id)
+            ->exists();
+
+        if (!$isPlanAdmin && !$isMember) {
+            return response()->json([
+                'message' => 'You are not allowed to view this plan.',
+            ], 403);
+        }
+
+        $promptAfter = $this->postEventPromptAfter($plan);
+        $snoozedUntil = $plan->post_event_prompt_snoozed_until;
+
+        $shouldPrompt =
+            $isPlanAdmin &&
+            !$plan->is_archived &&
+            $plan->status === 'Plan Ongoing' &&
+            $plan->post_event_checked_at === null &&
+            $promptAfter !== null &&
+            now()->greaterThanOrEqualTo($promptAfter) &&
+            (
+                $snoozedUntil === null ||
+                now()->greaterThanOrEqualTo($snoozedUntil)
+            );
+
+        return response()->json([
+            'can_manage' => $isPlanAdmin,
+            'should_prompt' => $shouldPrompt,
+            'prompt_after' => optional($promptAfter)->toISOString(),
+            'snoozed_until' => optional($snoozedUntil)->toISOString(),
+            'post_event_checked_at' => optional(
+                $plan->post_event_checked_at
+            )->toISOString(),
+        ]);
+    }
+
+    public function resolvePostEvent(Request $request, Plan $plan)
+    {
+        if ($plan->is_deleted) {
+            return response()->json([
+                'message' => 'Plan not found.',
+            ], 404);
+        }
+
+        if ((int) $plan->admin_id !== (int) $request->user()->id) {
+            return response()->json([
+                'message' => 'Only the plan admin can update the post-event status.',
+            ], 403);
+        }
+
+        $validated = $request->validate([
+            'action' => [
+                'required',
+                Rule::in([
+                    'later',
+                    'completed_active',
+                    'completed_archive',
+                    'reschedule',
+                    'postpone',
+                    'cancel_archive',
+                ]),
+            ],
+            'plan_date' => [
+                Rule::requiredIf(
+                    fn () => $request->input('action') === 'reschedule'
+                ),
+                'nullable',
+                'date',
+                'after_or_equal:today',
+            ],
+            'plan_time' => [
+                'nullable',
+                'date_format:H:i',
+            ],
+        ]);
+
+        $action = $validated['action'];
+
+        DB::transaction(function () use ($plan, $validated, $action) {
+            if ($action === 'later') {
+                $plan->update([
+                    'post_event_prompt_snoozed_until' => now()->addDay(),
+                ]);
+                return;
+            }
+
+            if ($action === 'completed_active') {
+                $plan->update([
+                    'status' => 'Completed',
+                    'completed_at' => now(),
+                    'post_event_checked_at' => now(),
+                    'post_event_prompt_snoozed_until' => null,
+                    'is_archived' => false,
+                ]);
+                return;
+            }
+
+            if ($action === 'completed_archive') {
+                $plan->update([
+                    'status' => 'Completed',
+                    'completed_at' => now(),
+                    'post_event_checked_at' => now(),
+                    'post_event_prompt_snoozed_until' => null,
+                    'is_archived' => true,
+                ]);
+                return;
+            }
+
+            if ($action === 'reschedule') {
+                $plan->update([
+                    'plan_date' => $validated['plan_date'],
+                    'plan_time' => $validated['plan_time'] ?? null,
+                    'status' => 'Plan Ongoing',
+                    'completed_at' => null,
+                    'post_event_checked_at' => null,
+                    'post_event_prompt_snoozed_until' => null,
+                    'is_archived' => false,
+                ]);
+                return;
+            }
+
+            if ($action === 'postpone') {
+                $plan->update([
+                    'plan_date' => null,
+                    'plan_time' => null,
+                    'status' => 'Plan Postponed',
+                    'completed_at' => null,
+                    'post_event_checked_at' => now(),
+                    'post_event_prompt_snoozed_until' => null,
+                    'is_archived' => false,
+                ]);
+                return;
+            }
+
+            $plan->update([
+                'status' => 'Plan Canceled',
+                'completed_at' => null,
+                'post_event_checked_at' => now(),
+                'post_event_prompt_snoozed_until' => null,
+                'is_archived' => true,
+            ]);
+        });
+
+        $message = match ($action) {
+            'later' => 'We will ask again tomorrow.',
+            'completed_active' => 'Plan marked as completed.',
+            'completed_archive' => 'Plan completed and archived.',
+            'reschedule' => 'Plan rescheduled successfully.',
+            'postpone' => 'Plan marked as postponed.',
+            'cancel_archive' => 'Plan canceled and archived.',
+        };
+
+        return response()->json([
+            'message' => $message,
+            'plan' => $plan->fresh()->load(['admin', 'members']),
         ]);
     }
 
@@ -592,6 +892,25 @@ class PlanController extends Controller
             'reviewed_at' => null,
             'reviewed_by' => null,
         ]);
+    }
+
+    private function postEventPromptAfter(Plan $plan): ?Carbon
+    {
+        if (!$plan->plan_date) {
+            return null;
+        }
+
+        $date = Carbon::parse($plan->plan_date);
+
+        if ($plan->plan_time) {
+            return Carbon::parse(
+                $date->toDateString() . ' ' . $plan->plan_time
+            )->addHours(12);
+        }
+
+        return $date->copy()
+            ->addDay()
+            ->setTime(9, 0);
     }
 
     private function generateUniqueInviteCode(): string

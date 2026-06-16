@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\User;
+use App\Services\ActivityNotifier;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
@@ -18,6 +19,24 @@ class UserSettingsController extends Controller
     public function show(Request $request): JsonResponse
     {
         $user = $request->user();
+
+        if ($user->email_verified_at !== null) {
+            ActivityNotifier::notifyUser(
+                recipientUserId: (int) $user->id,
+                actorUserId: null,
+                type: 'account_email_verified',
+                data: [
+                    'activity_tab' => 'notifications',
+                    'requires_action' => false,
+                    'verified_at' => optional(
+                        $user->email_verified_at
+                    )->toISOString(),
+                ],
+                notificationKey:
+                    'account:' . $user->id . ':email-verified',
+                replaceExisting: false,
+            );
+        }
 
         return response()->json([
             'success' => true,
@@ -404,6 +423,20 @@ class UserSettingsController extends Controller
         );
 
         $user->save();
+
+        ActivityNotifier::notifyUser(
+            recipientUserId: (int) $user->id,
+            actorUserId: null,
+            type: 'account_password_changed',
+            data: [
+                'activity_tab' => 'notifications',
+                'requires_action' => false,
+                'changed_at' => now()->toISOString(),
+            ],
+            notificationKey:
+                'account:' . $user->id . ':password:' . now()->format('YmdHi'),
+            replaceExisting: false,
+        );
 
         return response()->json([
             'success' => true,

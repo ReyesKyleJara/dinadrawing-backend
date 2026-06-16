@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Models\BudgetAllocation;
 use App\Models\Plan;
 use App\Models\PlanBudget;
+use App\Services\ActivityNotifier;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
@@ -68,6 +69,13 @@ class PlanBudgetController extends Controller
             budget: null,
         );
 
+        $this->syncContributionNotifications(
+            $plan,
+            $budget,
+            (int) $request->user()->id,
+            []
+        );
+
         return response()->json([
             'success' => true,
             'message' => 'Budget plan created.',
@@ -95,10 +103,32 @@ class PlanBudgetController extends Controller
             ], 404);
         }
 
+        $oldAllocations = $budget->allocations()
+            ->get()
+            ->mapWithKeys(
+                fn (BudgetAllocation $allocation) => [
+                    (int) $allocation->id => [
+                        'id' => (int) $allocation->id,
+                        'user_id' => $allocation->user_id === null
+                            ? null
+                            : (int) $allocation->user_id,
+                        'planned_share' => (float) $allocation->planned_share,
+                    ],
+                ]
+            )
+            ->all();
+
         $budget = $this->saveBudget(
             request: $request,
             plan: $plan,
             budget: $budget,
+        );
+
+        $this->syncContributionNotifications(
+            $plan,
+            $budget,
+            (int) $request->user()->id,
+            $oldAllocations
         );
 
         return response()->json([
@@ -149,6 +179,26 @@ class PlanBudgetController extends Controller
             $request->user()->id;
 
         $budget->save();
+
+        if ($budget->contribution_tracking_enabled) {
+            $this->syncContributionNotifications(
+                $plan,
+                $budget->fresh(),
+                (int) $request->user()->id,
+                []
+            );
+        } else {
+            ActivityNotifier::deleteByTypesForPlan(
+                (int) $plan->id,
+                [
+                    'budget_contribution_required',
+                    'budget_contribution_changed',
+                    'budget_allocation_assigned',
+                    'budget_allocation_changed',
+                    'budget_payment_rejected',
+                ]
+            );
+        }
 
         return response()->json([
             'success' => true,
@@ -310,6 +360,18 @@ class PlanBudgetController extends Controller
             }
         );
 
+        ActivityNotifier::deleteByKey(
+            'budget:' . $budget->id . ':review',
+            (int) $request->user()->id
+        );
+
+        $this->syncContributionNotifications(
+            $plan,
+            $budget->fresh(),
+            (int) $request->user()->id,
+            []
+        );
+
         return response()->json([
             'success' => true,
             'message' =>
@@ -402,6 +464,7 @@ class PlanBudgetController extends Controller
         ]);
 
         $isPaid = (bool) $validated['is_paid'];
+        $wasPaid = (bool) $allocation->is_paid;
 
         $allocation->update([
             'is_paid' => $isPaid,
@@ -412,6 +475,96 @@ class PlanBudgetController extends Controller
                 ? $userId
                 : null,
         ]);
+
+        $amount = (float) $allocation->planned_share;
+        $contributionKey =
+            'budget:' . $budget->id .
+            ':contribution:' . $allocation->id;
+        $reviewKey =
+            'budget:' . $budget->id .
+            ':payment:' . $allocation->id .
+            ':review';
+
+        if (!$isAdmin && $isPaid) {
+            ActivityNotifier::deleteByKey(
+                $contributionKey,
+                $userId
+            );
+
+            ActivityNotifier::notifyUser(
+                recipientUserId: (int) $plan->admin_id,
+                actorUserId: $userId,
+                type: 'budget_payment_submitted',
+                planId: (int) $plan->id,
+                data: [
+                    'activity_tab' => 'notifications',
+                    'requires_action' => false,
+                    'action' => 'view_budget',
+                    'budget_id' => (int) $budget->id,
+                    'allocation_id' => (int) $allocation->id,
+                    'amount' => $amount,
+                ],
+                notificationKey: $reviewKey,
+                replaceExisting: true,
+            );
+        }
+
+        if (
+            $isAdmin &&
+            $allocation->user_id !== null &&
+            (int) $allocation->user_id !== $userId
+        ) {
+            ActivityNotifier::deleteByKey($reviewKey);
+
+            if ($isPaid) {
+                ActivityNotifier::deleteByKey(
+                    $contributionKey,
+                    (int) $allocation->user_id
+                );
+
+                ActivityNotifier::notifyUser(
+                    recipientUserId: (int) $allocation->user_id,
+                    actorUserId: $userId,
+                    type: 'budget_payment_verified',
+                    planId: (int) $plan->id,
+                    data: [
+                        'activity_tab' => 'notifications',
+                        'requires_action' => false,
+                        'budget_id' => (int) $budget->id,
+                        'allocation_id' => (int) $allocation->id,
+                        'amount' => $amount,
+                    ],
+                    notificationKey:
+                        'budget:' . $budget->id .
+                        ':payment:' . $allocation->id .
+                        ':result',
+                    replaceExisting: true,
+                );
+            } elseif ($wasPaid) {
+                ActivityNotifier::notifyUser(
+                    recipientUserId: (int) $allocation->user_id,
+                    actorUserId: $userId,
+                    type: 'budget_payment_rejected',
+                    planId: (int) $plan->id,
+                    data: [
+                        'activity_tab' => 'action_required',
+                        'requires_action' => true,
+                        'action' => 'settle_up',
+                        'budget_id' => (int) $budget->id,
+                        'allocation_id' => (int) $allocation->id,
+                        'amount' => $amount,
+                    ],
+                    notificationKey: $contributionKey,
+                    replaceExisting: true,
+                );
+            }
+        }
+
+        $this->notifyWhenAllContributionsSettled(
+            $plan,
+            $budget->fresh(),
+            $userId
+        );
 
         return response()->json([
             'success' => true,
@@ -442,7 +595,22 @@ class PlanBudgetController extends Controller
             ], 404);
         }
 
+        $budgetId = (int) $budget->id;
         $budget->delete();
+
+        ActivityNotifier::deleteByTypesForPlan(
+            (int) $plan->id,
+            [
+                'budget_contribution_required',
+                'budget_contribution_changed',
+                'budget_allocation_assigned',
+                'budget_allocation_changed',
+                'budget_payment_submitted',
+                'budget_payment_verified',
+                'budget_payment_rejected',
+                'budget_all_settled',
+            ]
+        );
 
         return response()->json([
             'success' => true,
@@ -1071,6 +1239,131 @@ class PlanBudgetController extends Controller
 
                 return $budget->fresh();
             }
+        );
+    }
+
+    private function syncContributionNotifications(
+        Plan $plan,
+        PlanBudget $budget,
+        int $actorUserId,
+        array $oldAllocations
+    ): void {
+        $budget->load('allocations');
+
+        $currentIds = [];
+
+        foreach ($budget->allocations as $allocation) {
+            $allocationId = (int) $allocation->id;
+            $currentIds[] = $allocationId;
+
+            if (
+                $allocation->user_id === null ||
+                !$allocation->is_included ||
+                $allocation->is_former_member ||
+                $allocation->is_paid
+            ) {
+                ActivityNotifier::deleteByKey(
+                    'budget:' . $budget->id .
+                    ':contribution:' . $allocationId
+                );
+                continue;
+            }
+
+            $old = $oldAllocations[$allocationId] ?? null;
+            $amountChanged = $old !== null &&
+                round((float) $old['planned_share'], 2) !==
+                round((float) $allocation->planned_share, 2);
+
+            $trackingEnabled =
+                (bool) $budget->contribution_tracking_enabled;
+
+            ActivityNotifier::notifyUser(
+                recipientUserId: (int) $allocation->user_id,
+                actorUserId: $actorUserId,
+                type: $trackingEnabled
+                    ? ($amountChanged
+                        ? 'budget_contribution_changed'
+                        : 'budget_contribution_required')
+                    : ($amountChanged
+                        ? 'budget_allocation_changed'
+                        : 'budget_allocation_assigned'),
+                planId: (int) $plan->id,
+                data: [
+                    'activity_tab' => $trackingEnabled
+                        ? 'action_required'
+                        : 'notifications',
+                    'requires_action' => $trackingEnabled,
+                    'action' => $trackingEnabled
+                        ? 'settle_up'
+                        : 'view_budget',
+                    'budget_id' => (int) $budget->id,
+                    'allocation_id' => $allocationId,
+                    'amount' => (float) $allocation->planned_share,
+                ],
+                notificationKey:
+                    'budget:' . $budget->id .
+                    ':contribution:' . $allocationId,
+                replaceExisting: true,
+            );
+        }
+
+        foreach ($oldAllocations as $oldAllocationId => $old) {
+            if (!in_array((int) $oldAllocationId, $currentIds, true)) {
+                ActivityNotifier::deleteByKey(
+                    'budget:' . $budget->id .
+                    ':contribution:' . $oldAllocationId
+                );
+                ActivityNotifier::deleteByKey(
+                    'budget:' . $budget->id .
+                    ':payment:' . $oldAllocationId .
+                    ':review'
+                );
+            }
+        }
+    }
+
+    private function notifyWhenAllContributionsSettled(
+        Plan $plan,
+        PlanBudget $budget,
+        int $actorUserId
+    ): void {
+        $requiredCount = $budget->allocations()
+            ->where('is_included', true)
+            ->where('is_former_member', false)
+            ->whereNotNull('user_id')
+            ->count();
+
+        if ($requiredCount === 0) {
+            return;
+        }
+
+        $unpaidCount = $budget->allocations()
+            ->where('is_included', true)
+            ->where('is_former_member', false)
+            ->whereNotNull('user_id')
+            ->where('is_paid', false)
+            ->count();
+
+        if ($unpaidCount > 0) {
+            ActivityNotifier::deleteByKey(
+                'budget:' . $budget->id . ':all-settled'
+            );
+            return;
+        }
+
+        ActivityNotifier::notifyUser(
+            recipientUserId: (int) $plan->admin_id,
+            actorUserId: $actorUserId,
+            type: 'budget_all_settled',
+            planId: (int) $plan->id,
+            data: [
+                'activity_tab' => 'notifications',
+                'requires_action' => false,
+                'budget_id' => (int) $budget->id,
+            ],
+            notificationKey:
+                'budget:' . $budget->id . ':all-settled',
+            replaceExisting: true,
         );
     }
 

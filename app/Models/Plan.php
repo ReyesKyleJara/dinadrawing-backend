@@ -23,6 +23,9 @@ class Plan extends Model
         'theme_color',
         'is_archived',
         'is_deleted',
+        'post_event_checked_at',
+        'completed_at',
+        'post_event_prompt_snoozed_until',
     ];
 
     protected $casts = [
@@ -31,6 +34,9 @@ class Plan extends Model
         'longitude' => 'float',
         'is_archived' => 'boolean',
         'is_deleted' => 'boolean',
+        'post_event_checked_at' => 'datetime',
+        'completed_at' => 'datetime',
+        'post_event_prompt_snoozed_until' => 'datetime',
     ];
 
     protected $appends = [

@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\ActivityNotification;
 use App\Models\Plan;
 use App\Models\PlanInvitation;
 use App\Models\User;
@@ -335,6 +336,53 @@ class PlanInvitationController extends Controller
                         $invitation->read_at ??
                         now(),
                 ]);
+
+                /*
+                 * Notify both the person who sent the invitation and the
+                 * plan admin. When they are the same user, only one
+                 * notification is created.
+                 */
+                $recipientIds = collect([
+                    $invitation->invited_by,
+                    $plan->admin_id,
+                ])
+                    ->filter()
+                    ->map(
+                        fn ($userId): int =>
+                            (int) $userId
+                    )
+                    ->unique()
+                    ->values();
+
+                foreach ($recipientIds as $recipientId) {
+                    ActivityNotification::create([
+                        'recipient_user_id' =>
+                            $recipientId,
+                        'actor_user_id' =>
+                            $request->user()->id,
+                        'type' =>
+                            $responseValue === 'accepted'
+                                ? 'invitation_accepted'
+                                : 'invitation_declined',
+                        'plan_id' =>
+                            $plan->id,
+                        'plan_post_id' => null,
+                        'plan_post_comment_id' => null,
+                        'data' => [
+                            'invitation_id' =>
+                                (int) $invitation->id,
+                            'invitation_status' =>
+                                $responseValue,
+                            'invited_user_id' =>
+                                (int) $request->user()->id,
+                            'invited_user_name' =>
+                                (string) $request->user()->name,
+                            'invited_user_username' =>
+                                $request->user()->username,
+                        ],
+                        'read_at' => null,
+                    ]);
+                }
             }
         );
 

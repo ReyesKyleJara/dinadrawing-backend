@@ -6,6 +6,7 @@ use Carbon\Carbon;
 use App\Models\Plan;
 use App\Models\PlanPost;
 use App\Models\PlanPostVote;
+use App\Services\ActivityNotifier;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
@@ -183,6 +184,17 @@ class PlanPostController extends Controller
             }
         });
 
+        ActivityNotifier::deleteByKey(
+            'poll:' . $post->id . ':vote',
+            (int) $user->id
+        );
+
+        $this->notifyPollOwnerAboutVotes(
+            $post,
+            $plan,
+            (int) $user->id
+        );
+
         $post->load([
             'user:id,name,username,email',
             'votes.user:id,name,username',
@@ -266,6 +278,30 @@ class PlanPostController extends Controller
         $post->update([
             'poll_options' => $options,
         ]);
+
+        $votedUserIds = $post->votes()
+            ->where('user_id', '!=', $user->id)
+            ->pluck('user_id')
+            ->unique()
+            ->map(fn ($id) => (int) $id)
+            ->all();
+
+        ActivityNotifier::notifyUsers(
+            recipientUserIds: $votedUserIds,
+            actorUserId: (int) $user->id,
+            type: 'poll_vote_review_required',
+            planId: (int) $plan->id,
+            planPostId: (int) $post->id,
+            data: [
+                'activity_tab' => 'action_required',
+                'requires_action' => true,
+                'action' => 'review_vote',
+                'poll_question' => (string) $post->poll_question,
+                'new_option' => $newOption,
+            ],
+            notificationKey: 'poll:' . $post->id . ':vote',
+            replaceExisting: true,
+        );
 
         $post->load([
             'user:id,name,username,email',
@@ -353,6 +389,34 @@ class PlanPostController extends Controller
         }
 
         $post->update($updates);
+
+        if ($post->is_voting_closed) {
+            ActivityNotifier::deleteByKey(
+                'poll:' . $post->id . ':vote'
+            );
+
+            ActivityNotifier::notifyPlan(
+                plan: $plan,
+                actorUserId: (int) $user->id,
+                type: 'poll_voting_closed',
+                data: [
+                    'activity_tab' => 'notifications',
+                    'requires_action' => false,
+                    'poll_question' => (string) $post->poll_question,
+                ],
+                planPostId: (int) $post->id,
+                excludeUserId: (int) $user->id,
+                notificationKey: 'poll:' . $post->id . ':closed',
+                replaceExisting: true,
+            );
+        } else {
+            $this->notifyEligiblePollVoters(
+                $plan,
+                $post,
+                (int) $user->id,
+                'poll_vote_required'
+            );
+        }
 
         $post->load([
             'user:id,name,username,email',
@@ -643,6 +707,28 @@ class PlanPostController extends Controller
             'applied_to_plan_at' => null,
         ]);
 
+        ActivityNotifier::deleteByKey(
+            'poll:' . $post->id . ':vote'
+        );
+
+        ActivityNotifier::notifyPlan(
+            plan: $plan,
+            actorUserId: (int) $user->id,
+            type: 'poll_finalized',
+            data: [
+                'activity_tab' => 'notifications',
+                'requires_action' => false,
+                'poll_question' => (string) $post->poll_question,
+                'winning_option' => (string) $options[$selectedIndex],
+                'winning_option_index' => (int) $selectedIndex,
+                'poll_kind' => (string) ($post->poll_kind ?? 'general'),
+            ],
+            planPostId: (int) $post->id,
+            excludeUserId: (int) $user->id,
+            notificationKey: 'poll:' . $post->id . ':finalized',
+            replaceExisting: true,
+        );
+
         $post->load([
             'user:id,name,username,email',
             'votes.user:id,name,username',
@@ -739,6 +825,25 @@ class PlanPostController extends Controller
         $post->update([
             'applied_to_plan_at' => now(),
         ]);
+
+        ActivityNotifier::notifyPlan(
+            plan: $plan->fresh(),
+            actorUserId: (int) $user->id,
+            type: $post->poll_kind === 'date'
+                ? 'plan_date_changed'
+                : 'plan_location_changed',
+            data: [
+                'activity_tab' => 'notifications',
+                'requires_action' => false,
+                'change_source' => 'poll_result',
+                'poll_question' => (string) $post->poll_question,
+                'new_value' => (string) $selectedOption,
+            ],
+            planPostId: (int) $post->id,
+            excludeUserId: (int) $user->id,
+            notificationKey: 'poll:' . $post->id . ':applied',
+            replaceExisting: true,
+        );
 
         $post->load([
             'user:id,name,username,email',
@@ -908,6 +1013,12 @@ class PlanPostController extends Controller
             'user:id,name,username,email',
             'votes.user:id,name,username',
         ]);
+
+        $this->notifyPollCreated(
+            $plan,
+            $post,
+            $userId
+        );
 
         return response()->json([
             'message' => 'Poll created successfully.',
@@ -1305,6 +1416,114 @@ class PlanPostController extends Controller
             'can_vote' => true,
             'message' => '',
         ];
+    }
+
+    private function notifyPollCreated(
+        Plan $plan,
+        PlanPost $post,
+        int $creatorUserId
+    ): void {
+        $state = $this->getPollVotingState($post);
+
+        if ($state['status'] === 'open') {
+            $this->notifyEligiblePollVoters(
+                $plan,
+                $post,
+                $creatorUserId,
+                'poll_vote_required'
+            );
+
+            return;
+        }
+
+        ActivityNotifier::notifyPlan(
+            plan: $plan,
+            actorUserId: $creatorUserId,
+            type: 'poll_scheduled',
+            data: [
+                'activity_tab' => 'notifications',
+                'requires_action' => false,
+                'poll_question' => (string) $post->poll_question,
+                'voting_starts_at' => optional($post->voting_starts_at)->toISOString(),
+            ],
+            planPostId: (int) $post->id,
+            excludeUserId: $creatorUserId,
+            notificationKey: 'poll:' . $post->id . ':scheduled',
+            replaceExisting: true,
+        );
+    }
+
+    private function notifyEligiblePollVoters(
+        Plan $plan,
+        PlanPost $post,
+        int $actorUserId,
+        string $type
+    ): void {
+        $votedUserIds = $post->votes()
+            ->pluck('user_id')
+            ->map(fn ($id) => (int) $id)
+            ->unique()
+            ->all();
+
+        $recipientIds = collect(
+            ActivityNotifier::planRecipientIds(
+                $plan,
+                $actorUserId
+            )
+        )->reject(
+            fn ($id) => in_array((int) $id, $votedUserIds, true)
+        );
+
+        ActivityNotifier::notifyUsers(
+            recipientUserIds: $recipientIds,
+            actorUserId: $actorUserId,
+            type: $type,
+            planId: (int) $plan->id,
+            planPostId: (int) $post->id,
+            data: [
+                'activity_tab' => 'action_required',
+                'requires_action' => true,
+                'action' => 'vote',
+                'poll_question' => (string) $post->poll_question,
+                'poll_kind' => (string) ($post->poll_kind ?? 'general'),
+                'voting_ends_at' => optional($post->voting_ends_at)->toISOString(),
+            ],
+            notificationKey: 'poll:' . $post->id . ':vote',
+            replaceExisting: true,
+        );
+    }
+
+    private function notifyPollOwnerAboutVotes(
+        PlanPost $post,
+        Plan $plan,
+        int $actorUserId
+    ): void {
+        $ownerUserId = (int) $post->user_id;
+
+        if ($ownerUserId === $actorUserId) {
+            return;
+        }
+
+        $totalVoters = $post->votes()
+            ->pluck('user_id')
+            ->unique()
+            ->count();
+
+        ActivityNotifier::notifyUser(
+            recipientUserId: $ownerUserId,
+            actorUserId: $actorUserId,
+            type: 'poll_votes_received',
+            planId: (int) $plan->id,
+            planPostId: (int) $post->id,
+            data: [
+                'activity_tab' => 'notifications',
+                'requires_action' => false,
+                'poll_question' => (string) $post->poll_question,
+                'vote_count' => (int) $totalVoters,
+            ],
+            notificationKey: 'poll:' . $post->id . ':votes',
+            replaceExisting: true,
+        );
     }
 
     private function canManagePoll(PlanPost $post, Plan $plan, int $userId): bool

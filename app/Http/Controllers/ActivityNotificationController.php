@@ -21,7 +21,7 @@ class ActivityNotificationController extends Controller
         $notifications = ActivityNotification::query()
             ->with([
                 'actor:id,name,username,profile_photo_path',
-                'plan:id,title,banner_color,status,is_archived,is_deleted',
+                'plan:id,title,banner_color,status,plan_date,plan_time,location,is_archived,is_deleted',
                 'post:id,plan_id,user_id,post_type,content,poll_question,responsibility_title',
             ])
             ->where('recipient_user_id', $userId)
@@ -32,7 +32,7 @@ class ActivityNotificationController extends Controller
         $invitations = PlanInvitation::query()
             ->with([
                 'inviter:id,name,username,profile_photo_path',
-                'plan:id,title,banner_color,status,is_archived,is_deleted',
+                'plan:id,title,banner_color,status,plan_date,plan_time,location,is_archived,is_deleted',
             ])
             ->where('invited_user_id', $userId)
             ->latest()
@@ -100,7 +100,7 @@ class ActivityNotificationController extends Controller
 
         $notification->load([
             'actor:id,name,username,profile_photo_path',
-            'plan:id,title,banner_color,status,is_archived,is_deleted',
+            'plan:id,title,banner_color,status,plan_date,plan_time,location,is_archived,is_deleted',
             'post:id,plan_id,user_id,post_type,content,poll_question,responsibility_title',
         ]);
 
@@ -186,6 +186,9 @@ class ActivityNotificationController extends Controller
                     'title' => (string) $plan->title,
                     'banner_color' => $plan->banner_color,
                     'status' => $plan->status,
+                    'plan_date' => $plan->plan_date,
+                    'plan_time' => $plan->plan_time,
+                    'location' => $plan->location,
                     'is_archived' =>
                         (bool) $plan->is_archived,
                     'is_deleted' =>
@@ -255,6 +258,9 @@ class ActivityNotificationController extends Controller
                     'title' => (string) $plan->title,
                     'banner_color' => $plan->banner_color,
                     'status' => $plan->status,
+                    'plan_date' => $plan->plan_date,
+                    'plan_time' => $plan->plan_time,
+                    'location' => $plan->location,
                     'is_archived' =>
                         (bool) $plan->is_archived,
                     'is_deleted' =>

@@ -55,11 +55,14 @@ Route::middleware('auth:sanctum')->group(function () {
 
     // Single Plan
     Route::get('/plans/{plan}', [PlanController::class, 'show']);
+    Route::get('/plans/{plan}/post-event-status', [PlanController::class, 'postEventStatus']);
+    Route::patch('/plans/{plan}/post-event', [PlanController::class, 'resolvePostEvent']);
     Route::patch('/plans/{plan}', [PlanController::class, 'update']);
     Route::patch('/plans/{plan}/banner', [PlanController::class, 'updateBanner']);
     Route::post('/plans/{plan}/appearance', [PlanController::class, 'updateAppearance']);
     Route::delete('/plans/{plan}', [PlanController::class, 'destroy']);
     Route::post('/plans/{plan}/leave', [PlanController::class, 'leave']);
+    Route::delete('/plans/{plan}/members/{member}', [PlanController::class, 'removeMember']);
 
     // Plan Invitations
     Route::post('/plans/{plan}/invitations', [PlanInvitationController::class, 'store']);
