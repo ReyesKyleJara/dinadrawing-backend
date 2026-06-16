@@ -731,6 +731,8 @@ class PlanPostController extends Controller
 
             $plan->update([
                 'location' => $location,
+                'latitude' => null,
+                'longitude' => null,
             ]);
         }
 
